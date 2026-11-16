@@ -50,21 +50,72 @@ pub struct Config {
     /// Сглаживание счётчика FPS (0..1, больше — плавнее).
     pub fps_smoothing: f64,
 
-    // ---------------------------------------------------------------- тестовая сцена
-    /// Длина полного цикла суток в тестовой сцене, секунды.
-    pub day_length_s: f32,
-    /// Ускорение времени по клавише T.
-    pub fast_time_mul: f32,
-    /// Время суток при старте (0 — полночь, 0.5 — полдень).
-    pub start_time_of_day: f32,
+    // ---------------------------------------------------------------- время суток
+    /// Скорость хода времени по клавише T, игровых часов в секунду.
+    pub fast_time_hours_per_s: f32,
+    /// Шаг времени клавишами [ и ], часов.
+    pub time_step_hours: f32,
     /// Увеличение панелей на отладочном экране шрифтов (вторая строка панелей).
     pub debug_zoom: u32,
+
+    // ---------------------------------------------------------------- камера и рендер сцены
+    /// Вертикальный угол обзора, градусы.
+    pub fov_y_deg: f32,
+    /// Дальность прорисовки, м.
+    pub max_dist: f32,
+    /// Максимум шагов луча.
+    pub max_steps: u32,
+    /// Размер ячейки сетки ускорения, м.
+    pub accel_cell: f32,
+    /// Лучей на ячейку по стороне = round(высота ячейки / это значение), 1..=4.
+    pub supersample_cell_px: f32,
+
+    // ---------------------------------------------------------------- игрок (реальный масштаб)
+    /// Высота глаз над полом, м (рост ~1.75 м).
+    pub eye_height: f32,
+    /// Шаг, м/с.
+    pub walk_speed: f32,
+    /// Бег, м/с.
+    pub run_speed: f32,
+    /// Чувствительность мыши, рад на пиксель.
+    pub mouse_sens: f32,
+    /// Предел наклона головы, градусы.
+    pub max_pitch_deg: f32,
+    /// Радиус тела для коллизий, м.
+    pub body_radius: f32,
+    /// Максимальная высота ступени, м.
+    pub step_height: f32,
+    pub gravity: f32,
+    pub collision_iters: u32,
+    /// Покачивание камеры при ходьбе.
+    pub head_bob: bool,
+    /// Длина шага (полупериод покачивания), м.
+    pub stride: f32,
+    /// Амплитуда покачивания вверх-вниз и вбок, м.
+    pub bob_height: f32,
+    pub bob_side: f32,
+
+    // ---------------------------------------------------------------- субтитры
+    /// Субтитры — шрифт 5×8 с увеличением round(высота окна / это значение).
+    pub subtitle_px_per_scale: f32,
+    pub subtitle_fade_s: f32,
+    /// Пауза между репликами, с.
+    pub subtitle_gap_s: f32,
+    /// Ширина строки субтитров, доля экрана.
+    pub subtitle_width: f32,
+    /// Отступ снизу, строк.
+    pub subtitle_bottom_rows: u32,
+    pub subtitle_fg: Rgb,
+    pub subtitle_speaker: Rgb,
+    /// Непрозрачность тёмной плашки под текстом.
+    pub subtitle_plate_alpha: f32,
+    /// Непрозрачность плашки отладочного HUD (F3).
+    pub hud_plate_alpha: f32,
 
     // ---------------------------------------------------------------- HUD
     pub hud_fg: Rgb,
     pub hud_accent: Rgb,
     pub hud_dim: Rgb,
-    pub hud_plate: Rgb,
 
     // ---------------------------------------------------------------- окно
     pub window_title: &'static str,
@@ -98,15 +149,43 @@ impl Default for Config {
             vsync: true,
             fps_smoothing: 0.95,
 
-            day_length_s: 60.0,
-            fast_time_mul: 10.0,
-            start_time_of_day: 0.70,
+            fast_time_hours_per_s: 0.6,
+            time_step_hours: 1.0,
             debug_zoom: 3,
+
+            fov_y_deg: 58.0,
+            max_dist: 900.0,
+            max_steps: 220,
+            accel_cell: 2.0,
+            supersample_cell_px: 6.0,
+
+            eye_height: 1.65,
+            walk_speed: 1.4,
+            run_speed: 3.5,
+            mouse_sens: 0.0022,
+            max_pitch_deg: 80.0,
+            body_radius: 0.3,
+            step_height: 0.32,
+            gravity: 9.81,
+            collision_iters: 4,
+            head_bob: true,
+            stride: 0.75,
+            bob_height: 0.03,
+            bob_side: 0.018,
+
+            subtitle_px_per_scale: 540.0,
+            subtitle_fade_s: 0.35,
+            subtitle_gap_s: 0.4,
+            subtitle_width: 0.6,
+            subtitle_bottom_rows: 3,
+            subtitle_fg: [0.95, 0.94, 0.90],
+            subtitle_speaker: [1.0, 0.78, 0.30],
+            subtitle_plate_alpha: 0.45,
+            hud_plate_alpha: 0.6,
 
             hud_fg: [0.92, 0.92, 0.88],
             hud_accent: [1.0, 0.78, 0.25],
             hud_dim: [0.55, 0.57, 0.6],
-            hud_plate: [0.03, 0.035, 0.045],
 
             window_title: "ASCII City",
             window_size: (1600, 900),

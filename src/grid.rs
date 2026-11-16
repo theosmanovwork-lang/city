@@ -10,12 +10,6 @@ pub type Rgba8 = [u8; 4];
 
 pub const BLACK: Rgba8 = [0, 0, 0, 0];
 
-/// Сплошной фон (не зависит от bgFill).
-pub fn solid(c: [f32; 3]) -> Rgba8 {
-    let [r, g, b] = to_u8(c);
-    [r, g, b, 255]
-}
-
 /// Цвет символа.
 pub fn rgb(c: [f32; 3]) -> Rgba8 {
     let [r, g, b] = to_u8(c);

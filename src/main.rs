@@ -1,26 +1,32 @@
-//! ASCII City — этап 1: окно, цикл с фиксированным шагом, вывод сетки символов.
+//! ASCII City — окно, цикл с фиксированным шагом, ввод.
 //!
 //! Режим без окна: `ascii_city --screenshot out.png [--preset all|<имя>|<номер>]
-//! [--size 1920x1080] [--time 0.75] [--fonts]`.
+//! [--size 1920x1080] [--time 0.8] [--camera x,y,z,yaw,pitch] [--say "ИМЯ|текст"]
+//! [--fonts] [--hud] [--no-gap] [--no-bg]`.
 
 mod app;
+mod build;
 mod config;
+mod daylight;
 mod font;
 mod grid;
+mod player;
 mod renderer;
-mod scene;
+mod scenes;
+mod sdf;
 mod style;
+mod subtitles;
 
-use app::{Action, App};
+use app::{Action, App, Move};
 use config::Config;
 use renderer::Renderer;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,ascii_city=info")).init();
@@ -32,7 +38,7 @@ fn main() {
     }
     let event_loop = EventLoop::new().expect("не удалось создать цикл событий");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut handler = Handler::new(App::new(Config::default()));
+    let mut handler = Handler::new(App::new(Config::default(), scenes::test_street::build()));
     event_loop.run_app(&mut handler).expect("ошибка цикла событий");
 }
 
@@ -44,11 +50,12 @@ struct Handler {
     last: Instant,
     acc: f64,
     fps: f64,
+    grabbed: bool,
 }
 
 impl Handler {
     fn new(app: App) -> Handler {
-        Handler { app, window: None, renderer: None, last: Instant::now(), acc: 0.0, fps: 60.0 }
+        Handler { app, window: None, renderer: None, last: Instant::now(), acc: 0.0, fps: 60.0, grabbed: false }
     }
 
     fn redraw(&mut self) {
@@ -70,26 +77,72 @@ impl Handler {
         let k = self.app.cfg.fps_smoothing;
         self.fps = self.fps * k + (1.0 / dt.max(1e-4)) * (1.0 - k);
         self.app.fps = Some(self.fps);
+        self.app.grab_hint = !self.grabbed;
 
         self.app.draw();
         if let Some(r) = &mut self.renderer {
-            r.render(&self.app.layers());
+            r.render(self.app.scene_pass(), &self.app.layers());
+        }
+    }
+
+    fn set_grab(&mut self, on: bool) {
+        let Some(w) = &self.window else { return };
+        if on {
+            let ok = w
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined))
+                .is_ok();
+            w.set_cursor_visible(!ok);
+            self.grabbed = ok;
+        } else {
+            let _ = w.set_cursor_grab(CursorGrabMode::None);
+            w.set_cursor_visible(true);
+            self.grabbed = false;
+            self.app.release_all();
         }
     }
 
     fn key(&mut self, event_loop: &ActiveEventLoop, ev: &KeyEvent) {
-        if ev.state != ElementState::Pressed || ev.repeat {
+        // служебные клавиши распознаём и по логическому значению: на части систем
+        // (виртуальные X-серверы, удалённый доступ) у F-клавиш нет физического кода
+        let named = match &ev.logical_key {
+            Key::Named(NamedKey::F1) => Some(KeyCode::F1),
+            Key::Named(NamedKey::F3) => Some(KeyCode::F3),
+            Key::Named(NamedKey::F11) => Some(KeyCode::F11),
+            Key::Named(NamedKey::Escape) => Some(KeyCode::Escape),
+            _ => None,
+        };
+        let code = match (named, ev.physical_key) {
+            (Some(c), _) => c,
+            (None, PhysicalKey::Code(c)) => c,
+            _ => return,
+        };
+        let down = ev.state == ElementState::Pressed;
+        let mv = match code {
+            KeyCode::KeyW | KeyCode::ArrowUp => Some(Move::Forward),
+            KeyCode::KeyS | KeyCode::ArrowDown => Some(Move::Back),
+            KeyCode::KeyA => Some(Move::Left),
+            KeyCode::KeyD => Some(Move::Right),
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => Some(Move::Run),
+            _ => None,
+        };
+        if let Some(m) = mv {
+            self.app.hold(m, down);
             return;
         }
-        let PhysicalKey::Code(code) = ev.physical_key else { return };
+        if !down || ev.repeat {
+            return;
+        }
         let action = match code {
             KeyCode::Equal | KeyCode::NumpadAdd => Some(Action::DensityUp),
             KeyCode::Minus | KeyCode::NumpadSubtract => Some(Action::DensityDown),
             KeyCode::KeyG => Some(Action::ToggleGap),
             KeyCode::KeyB => Some(Action::ToggleBg),
             KeyCode::F1 => Some(Action::ToggleFontScreen),
+            KeyCode::F3 => Some(Action::ToggleHud),
             KeyCode::KeyT => Some(Action::ToggleFastTime),
-            KeyCode::Space => Some(Action::TogglePause),
+            KeyCode::BracketLeft => Some(Action::TimeBack),
+            KeyCode::BracketRight => Some(Action::TimeForward),
             KeyCode::F11 => {
                 if let Some(w) = &self.window {
                     let full = w.fullscreen().is_some();
@@ -98,7 +151,11 @@ impl Handler {
                 None
             }
             KeyCode::Escape => {
-                event_loop.exit();
+                if self.grabbed {
+                    self.set_grab(false);
+                } else {
+                    event_loop.exit();
+                }
                 None
             }
             _ => None,
@@ -120,7 +177,8 @@ impl ApplicationHandler for Handler {
             .with_inner_size(winit::dpi::LogicalSize::new(cfg.window_size.0, cfg.window_size.1));
         let window = Arc::new(event_loop.create_window(attrs).expect("не удалось создать окно"));
         let atlas = self.app.atlas();
-        let renderer = pollster::block_on(Renderer::for_window(window.clone(), cfg.vsync, &atlas));
+        let mut renderer = pollster::block_on(Renderer::for_window(window.clone(), cfg.vsync, &atlas));
+        renderer.load_scene(&self.app.scene, &self.app.accel);
         log::info!("{}", renderer.adapter_info);
         let size = window.inner_size(); // физические пиксели
         self.app.set_size(size.width, size.height);
@@ -142,9 +200,23 @@ impl ApplicationHandler for Handler {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 log::info!("масштаб экрана: {scale_factor}");
             }
+            WindowEvent::Focused(false) => self.set_grab(false),
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }
+                if !self.grabbed =>
+            {
+                self.set_grab(true);
+            }
             WindowEvent::KeyboardInput { event, .. } => self.key(event_loop, &event),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
+        }
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta } = event
+            && self.grabbed
+        {
+            self.app.look(delta.0 as f32, delta.1 as f32);
         }
     }
 
@@ -162,7 +234,7 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 /// Рендер без окна в PNG. `--preset all` — по файлу на каждый пресет (`out-3x5.png` и т.д.).
 fn screenshot(args: &[String], out: &str) {
-    let mut app = App::new(Config::default());
+    let mut app = App::new(Config::default(), scenes::test_street::build());
     let (w, h) = arg(args, "--size")
         .and_then(|s| s.split_once('x'))
         .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
@@ -170,14 +242,36 @@ fn screenshot(args: &[String], out: &str) {
     if let Some(t) = arg(args, "--time").and_then(|s| s.parse().ok()) {
         app.day_t = t;
     }
+    if let Some(c) = arg(args, "--camera") {
+        let v: Vec<f32> = c.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if v.len() >= 4 {
+            app.player.pos = [v[0], v[1], v[2]];
+            app.player.yaw = v[3].to_radians();
+            app.player.pitch = v.get(4).copied().unwrap_or(0.0).to_radians();
+        }
+    }
+    if let Some(s) = arg(args, "--say") {
+        let (who, text) = s.split_once('|').unwrap_or(("", s));
+        let line = subtitles::Line {
+            speaker: if who.is_empty() { None } else { Some(Box::leak(who.to_string().into_boxed_str())) },
+            text: Box::leak(text.to_string().into_boxed_str()),
+            secs: 10.0,
+        };
+        app.say(&[line]);
+        app.subtitles.update(0.0, 0.0);
+        app.subtitles.update(1.0, 0.0);
+    }
     app.font_screen = args.iter().any(|a| a == "--fonts");
+    app.hud = args.iter().any(|a| a == "--hud");
     app.gap_on = !args.iter().any(|a| a == "--no-gap");
     app.bg_on = !args.iter().any(|a| a == "--no-bg");
     app.set_size(w, h);
     let mut renderer = pollster::block_on(Renderer::headless(&app.atlas()));
+    renderer.load_scene(&app.scene, &app.accel);
     eprintln!("GPU: {}", renderer.adapter_info);
 
     let n = app.cfg.presets.len();
+    let many = arg(args, "--preset") == Some("all");
     let which: Vec<usize> = match arg(args, "--preset") {
         Some("all") => (0..n).collect(),
         Some(s) => vec![
@@ -191,12 +285,11 @@ fn screenshot(args: &[String], out: &str) {
     };
     for k in which {
         app.preset = k;
-        app.draw(); // прогрев: первый кадр выделяет буферы
         let t0 = Instant::now();
         app.draw();
-        let draw_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let px = renderer.render_offscreen(w, h, &app.layers());
-        let path = if which_many(args) {
+        let px = renderer.render_offscreen(w, h, app.scene_pass(), &app.layers());
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let path = if many {
             let name = app.preset().name.replace(' ', "");
             match out.rsplit_once('.') {
                 Some((stem, ext)) => format!("{stem}-{name}.{ext}"),
@@ -206,12 +299,8 @@ fn screenshot(args: &[String], out: &str) {
             out.to_string()
         };
         write_png(&path, w, h, &px);
-        eprintln!("{path}: {}x{} px, пресет {}, расчёт сетки на CPU {draw_ms:.1} мс", w, h, app.preset().name);
+        eprintln!("{path}: {w}x{h} px, пресет {}, кадр {ms:.0} мс", app.preset().name);
     }
-}
-
-fn which_many(args: &[String]) -> bool {
-    arg(args, "--preset") == Some("all")
 }
 
 fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) {

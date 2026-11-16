@@ -1,0 +1,15 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Скриншоты, сделанные локально (эталонные лежат в docs/screenshots/)
+/screenshot*.png
+/shots/
+
+# ОС и редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

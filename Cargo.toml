@@ -1,0 +1,13 @@
+[package]
+name = "ascii_city"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+env_logger = "0.11.11"
+log = "0.4.35"
+png = "0.18.1"
+pollster = "1.0.1"
+wgpu = "30"
+winit = "0.30"

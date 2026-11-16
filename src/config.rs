@@ -69,6 +69,13 @@ pub struct Config {
     pub accel_cell: f32,
     /// Лучей на ячейку по стороне = round(высота ячейки / это значение), 1..=4.
     pub supersample_cell_px: f32,
+    /// Свечение вокруг ярких источников (bloom) на уровне ячеек: сила и порог яркости.
+    pub bloom: f32,
+    pub bloom_threshold: f32,
+    /// Радиус свечения: ячеек на каждые 100 колонок сетки.
+    pub bloom_radius_per_100: f32,
+    /// Косинус углового радиуса диска луны/солнца по умолчанию.
+    pub moon_disc_cos: f32,
 
     // ---------------------------------------------------------------- игрок (реальный масштаб)
     /// Высота глаз над полом, м (рост ~1.75 м).
@@ -158,6 +165,10 @@ impl Default for Config {
             max_steps: 220,
             accel_cell: 2.0,
             supersample_cell_px: 6.0,
+            bloom: 0.9,
+            bloom_threshold: 0.55,
+            bloom_radius_per_100: 1.0,
+            moon_disc_cos: 0.99985,
 
             eye_height: 1.65,
             walk_speed: 1.4,

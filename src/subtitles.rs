@@ -43,8 +43,9 @@ impl Subtitles {
         }
     }
 
-    /// Нарисовать текущую реплику внизу по центру.
-    pub fn draw(&self, g: &mut Grid, cfg: &Config) {
+    /// Нарисовать текущую реплику внизу по центру. `bright` 0..1 — насколько светлый кадр
+    /// под субтитрами (например, засветка в белое): плашка становится плотнее.
+    pub fn draw(&self, g: &mut Grid, cfg: &Config, bright: f32) {
         let Some((l, t)) = &self.current else { return };
         let fade = cfg.subtitle_fade_s;
         let a = (t / fade).min(1.0).min(((l.secs - t) / fade).max(0.0)).clamp(0.0, 1.0);
@@ -59,7 +60,7 @@ impl Subtitles {
         let alpha = |k: f32| (k * a * 255.0) as u8;
         let fg = rgba(cfg.subtitle_fg, alpha(1.0));
         let name = rgba(cfg.subtitle_speaker, alpha(1.0));
-        let plate: Rgba8 = [0, 0, 0, alpha(cfg.subtitle_plate_alpha)];
+        let plate: Rgba8 = [0, 0, 0, alpha(cfg.subtitle_plate_alpha.max(0.85 * bright))];
         for (k, s) in lines.iter().enumerate() {
             let n = s.chars().count() as i32;
             let x = (g.cols as i32 - n) / 2;

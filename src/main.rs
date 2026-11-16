@@ -2,7 +2,8 @@
 //!
 //! Режим без окна: `ascii_city --screenshot out.png [--preset all|<имя>|<номер>]
 //! [--size 1920x1080] [--time 0.8] [--camera x,y,z,yaw,pitch] [--say "ИМЯ|текст"]
-//! [--fonts] [--hud] [--no-gap] [--no-bg]`.
+//! [--fonts] [--hud] [--no-gap] [--no-bg] [--scene alley|street] [--sim run:8,walk:2,idle:1,back:1]`.
+//! Игра: `ascii_city [--scene alley|street]` (по умолчанию — локация 1 «Сон. Переулок»).
 
 mod app;
 mod build;
@@ -10,6 +11,7 @@ mod config;
 mod daylight;
 mod font;
 mod grid;
+mod logic;
 mod player;
 mod renderer;
 mod scenes;
@@ -38,7 +40,8 @@ fn main() {
     }
     let event_loop = EventLoop::new().expect("не удалось создать цикл событий");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut handler = Handler::new(App::new(Config::default(), scenes::test_street::build()));
+    let scene = arg(&args, "--scene").unwrap_or(scenes::NAMES[0]);
+    let mut handler = Handler::new(App::new(Config::default(), scene));
     event_loop.run_app(&mut handler).expect("ошибка цикла событий");
 }
 
@@ -81,6 +84,7 @@ impl Handler {
 
         self.app.draw();
         if let Some(r) = &mut self.renderer {
+            r.update_prims(&self.app.scene.prims);
             r.render(self.app.scene_pass(), &self.app.layers());
         }
     }
@@ -234,7 +238,7 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 /// Рендер без окна в PNG. `--preset all` — по файлу на каждый пресет (`out-3x5.png` и т.д.).
 fn screenshot(args: &[String], out: &str) {
-    let mut app = App::new(Config::default(), scenes::test_street::build());
+    let mut app = App::new(Config::default(), arg(args, "--scene").unwrap_or(scenes::NAMES[0]));
     let (w, h) = arg(args, "--size")
         .and_then(|s| s.split_once('x'))
         .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
@@ -260,6 +264,30 @@ fn screenshot(args: &[String], out: &str) {
         app.say(&[line]);
         app.subtitles.update(0.0, 0.0);
         app.subtitles.update(1.0, 0.0);
+    }
+    // прогнать сценарий с заданным вводом: "run:8,walk:2,idle:1,back:1,turn:1"
+    if let Some(sim) = arg(args, "--sim") {
+        let step = 1.0 / app.cfg.update_hz;
+        for part in sim.split(',') {
+            let (what, secs) = part.split_once(':').unwrap_or((part, "1"));
+            let secs: f64 = secs.parse().unwrap_or(1.0);
+            app.release_all();
+            match what {
+                "run" => {
+                    app.hold(Move::Forward, true);
+                    app.hold(Move::Run, true);
+                }
+                "walk" => app.hold(Move::Forward, true),
+                "back" => app.hold(Move::Back, true),
+                "turn" => app.look(1400.0, 0.0),
+                _ => {}
+            }
+            for _ in 0..(secs / step) as u32 {
+                app.update(step);
+            }
+        }
+        app.release_all();
+        eprintln!("после --sim: попытка {}, игрок {:?}", app.attempt, app.player.pos);
     }
     app.font_screen = args.iter().any(|a| a == "--fonts");
     app.hud = args.iter().any(|a| a == "--hud");
@@ -287,6 +315,7 @@ fn screenshot(args: &[String], out: &str) {
         app.preset = k;
         let t0 = Instant::now();
         app.draw();
+        renderer.update_prims(&app.scene.prims);
         let px = renderer.render_offscreen(w, h, app.scene_pass(), &app.layers());
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let path = if many {

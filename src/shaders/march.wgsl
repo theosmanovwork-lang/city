@@ -22,6 +22,9 @@ struct Frame {
     ramp: array<vec4u, 8>,
     accel_o: vec4f,    // начало сетки x, z; размер ячейки; верх сцены
     accel_n: vec4u,    // nx, nz, начало и число дальних форм
+    fx: vec4f,         // затемнение, засветка, виньетка, вспышка
+    fx2: vec4f,        // сила свечения, порог свечения, подсветка фона, cos радиуса диска луны
+    fx3: vec4f,        // x: радиус свечения в ячейках
     lights: array<PLight, 16>,
 };
 
@@ -32,6 +35,9 @@ struct Frame {
 @group(0) @binding(4) var out_glyph: texture_storage_2d<r32uint, write>;
 @group(0) @binding(5) var out_fg: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(6) var out_bg: texture_storage_2d<rgba8unorm, write>;
+// цвет кадра между проходами: march пишет, post читает (w — звезда: 0, 1 «.», 2 «*»)
+@group(0) @binding(7) var out_color: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(8) var in_color: texture_2d<f32>;
 
 const GROUND: u32 = 0xffffffffu;
 const MISS: u32 = 0xfffffffeu;
@@ -70,7 +76,14 @@ fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.3, 0.59, 0.11)); }
 fn sd(i: u32, p: vec3f) -> f32 {
     let pr = prims[i];
     let q = p - pr.a.xyz;
-    if ((pr.k.x & 0xffu) == 1u) {
+    let shape = pr.k.x & 0xffu;
+    if (shape == 2u) {
+        // капсула a → b, радиус a.w
+        let ba = pr.b.xyz - pr.a.xyz;
+        let h = clamp(dot(q, ba) / max(dot(ba, ba), 1e-8), 0.0, 1.0);
+        return length(q - ba * h) - pr.a.w;
+    }
+    if (shape == 1u) {
         let d = vec2f(length(q.xz) - pr.b.x, abs(q.y) - pr.b.y);
         return min(max(d.x, d.y), 0.0) + length(max(d, vec2f(0.0)));
     }
@@ -201,7 +214,14 @@ fn sky(rd: vec3f) -> vec3f {
     let night = F.sun_col.w;
     if (cs > 0.0) {
         c += F.sun_col.rgb * (pow(cs, 300.0) * 0.6 + pow(cs, 12.0) * 0.08) * (1.0 - night);
-        if (cs > 0.99985) { c += F.sun_col.rgb * mix(2.5, 1.2, night); }
+        let disc = select(0.99985, F.fx2.w, night > 0.5);
+        if (cs > disc) {
+            // ночью — луна с «морями»
+            let m = 0.75 + 0.25 * hash3(i32(floor(rd.x * 900.0)), i32(floor(rd.y * 900.0)), 5);
+            c += F.sun_col.rgb * mix(2.5, 1.3 * m, night);
+        } else if (night > 0.5 && cs > F.fx2.w - 0.0015) {
+            c += F.sun_col.rgb * 0.15;  // ореол луны
+        }
     }
     return c;
 }
@@ -402,15 +422,15 @@ fn fog(col: vec3f, t: f32) -> vec3f {
     return mix(F.sky_hz.rgb * 0.85, col, f);
 }
 
-// ---------------------------------------------------------------- точка входа
+// ---------------------------------------------------------------- проход 1: лучи
 @compute @workgroup_size(8, 8)
-fn cs_main(@builtin(global_invocation_id) gid: vec3u) {
+fn cs_march(@builtin(global_invocation_id) gid: vec3u) {
     let cols = F.grid.x;
     let rows = F.grid.y;
     if (gid.x >= cols || gid.y >= rows) { return; }
     let ss = max(F.grid.z, 1u);
     var acc = vec3f(0.0);
-    var star = false;
+    var star = 0.0;
     var star_k = 0.0;
     for (var sy = 0u; sy < ss; sy++) {
         for (var sx = 0u; sx < ss; sx++) {
@@ -428,7 +448,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3u) {
                     let az = atan2(rd.x, rd.z);
                     let el = asin(clamp(rd.y, -1.0, 1.0));
                     let h = hash3(i32(floor(az / ang)), i32(floor(el / ang)), 99);
-                    if (h < 0.0035 && rd.y > 0.05) { star = true; star_k = (0.5 + 80.0 * h) * F.sun_col.w; }
+                    if (h < 0.0035 && rd.y > 0.05) {
+                        star_k = (0.5 + 80.0 * h) * F.sun_col.w;
+                        star = select(1.0, 2.0, star_k > 1.2);
+                    }
                 }
             } else {
                 c = fog(shade(ro, rd, r), r.t);
@@ -437,11 +460,55 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3u) {
         }
     }
     var col = acc / f32(ss * ss) * F.sky_top.w;
-    var glyph_override = 0u;
-    if (star) {
-        col += vec3f(0.9, 0.9, 1.0) * star_k;
-        glyph_override = select(F.ramp_info.y, F.ramp_info.z, star_k > 1.2);
+    if (star > 0.0) { col += vec3f(0.9, 0.9, 1.0) * star_k; }
+    textureStore(out_color, vec2i(i32(gid.x), i32(gid.y)), vec4f(col, star));
+}
+
+// ---------------------------------------------------------------- проход 2: свечение, эффекты, стиль
+@compute @workgroup_size(8, 8)
+fn cs_post(@builtin(global_invocation_id) gid: vec3u) {
+    let cols = F.grid.x;
+    let rows = F.grid.y;
+    if (gid.x >= cols || gid.y >= rows) { return; }
+    let cell = vec2i(i32(gid.x), i32(gid.y));
+    let src = textureLoad(in_color, cell, 0);
+    var col = src.rgb;
+
+    // свечение на уровне ячеек: яркие ячейки подсвечивают соседей (как bloom в эталоне)
+    var bloom = vec3f(0.0);
+    let rx = i32(F.fx3.x);
+    if (F.fx2.x > 0.0 && rx > 0) {
+        let ry = max(1, rx / 2);
+        let stx = max(1, rx / 3);
+        let sty = max(1, ry / 3);
+        var wsum = 0.0;
+        for (var dy = -ry; dy <= ry; dy += sty) {
+            for (var dx = -rx; dx <= rx; dx += stx) {
+                let q = clamp(cell + vec2i(dx, dy), vec2i(0), vec2i(i32(cols) - 1, i32(rows) - 1));
+                let c = textureLoad(in_color, q, 0).rgb;
+                let fxr = f32(dx) / f32(rx);
+                let fyr = f32(dy) / f32(ry);
+                let w = exp(-2.0 * (fxr * fxr + fyr * fyr));
+                bloom += max(c - vec3f(F.fx2.y), vec3f(0.0)) * w;
+                wsum += w;
+            }
+        }
+        bloom = bloom / wsum * F.fx2.x;
     }
+    col += bloom * 0.35;
+
+    // эффекты сценария
+    let uv = vec2f(f32(gid.x) / f32(cols), f32(gid.y) / f32(rows)) * 2.0 - 1.0;
+    let r2 = clamp(dot(uv, uv) * 0.5, 0.0, 1.0);
+    let vig = 1.0 - F.fx.z * r2 * r2 * 1.6;
+    col *= max(vig, 0.0);
+    bloom *= max(vig, 0.0);
+    col += vec3f(1.0, 0.9, 0.7) * F.fx.w;
+    col = mix(col, vec3f(1.2, 1.18, 1.12), F.fx.y);
+    bloom = mix(bloom, vec3f(0.8), F.fx.y);
+    col *= 1.0 - F.fx.x;
+    bloom *= 1.0 - F.fx.x;
+
     // ---------------- правило стиля (как style.rs)
     let L = lum(col);
     let n = F.ramp_info.x;
@@ -451,16 +518,17 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3u) {
         let k = min(1u + u32(sqrt(t) * f32(n - 1u)), n - 1u);
         glyph = F.ramp[k / 4u][k % 4u];
     }
-    if (glyph_override != 0u) { glyph = glyph_override; }
+    if (src.w > 0.5 && F.fx.x < 0.5 && F.fx.y < 0.5) {
+        glyph = select(F.ramp_info.y, F.ramp_info.z, src.w > 1.5);
+    }
     let m = max(col.r, max(col.g, col.b));
     var fg = vec3f(0.0);
-    var bg = vec3f(0.0);
     if (m > F.style.w) {
         fg = clamp(col * min(1.0 / m, F.style.z), vec3f(0.0), vec3f(1.0));
-        bg = clamp(col, vec3f(0.0), vec3f(1.0));
     }
-    let cell = vec2i(i32(gid.x), i32(gid.y));
+    // фон: подсветка цветом поверхности + свечение (альфа 1 — шейдер вывода берёт как есть)
+    let bg = clamp(col * F.fx2.z + bloom * 0.6, vec3f(0.0), vec3f(1.0));
     textureStore(out_glyph, cell, vec4u(glyph, 0u, 0u, 0u));
     textureStore(out_fg, cell, vec4f(fg, 1.0));
-    textureStore(out_bg, cell, vec4f(bg, 0.0));
+    textureStore(out_bg, cell, vec4f(bg, 1.0));
 }

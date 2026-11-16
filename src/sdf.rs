@@ -30,6 +30,8 @@ pub struct Prim {
 
 pub const SHAPE_BOX: u32 = 0;
 pub const SHAPE_CYL: u32 = 1;
+/// Капсула: отрезок a.xyz → b.xyz, радиус a.w (сфера — при a = b).
+pub const SHAPE_CAP: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
@@ -134,11 +136,19 @@ pub struct Scene {
     /// Плотность тумана, 1/м.
     pub fog: f32,
     pub triggers: Vec<Trigger>,
+    /// Габариты движения подвижных форм (индекс формы → min, max): по ним строится
+    /// сетка ускорения, чтобы форма оставалась в нужных ячейках, куда бы ни сдвинулась.
+    pub envelopes: Vec<(usize, V3, V3)>,
+    /// Ночное светило: направление и угловой радиус диска (None — обычная луна).
+    pub moon: Option<(V3, f32)>,
 }
+
+/// Флаг в k[0]: форма не участвует в коллизиях (например, стрелок из сна).
+pub const NO_COLLIDE: u32 = 1 << 16;
 
 impl Prim {
     pub fn group(&self) -> u32 {
-        self.k[0] >> 8
+        (self.k[0] >> 8) & 0xff
     }
     pub fn shape(&self) -> u32 {
         self.k[0] & 0xff
@@ -146,6 +156,12 @@ impl Prim {
 
     /// Габариты (min, max).
     pub fn aabb(&self) -> (V3, V3) {
+        if self.shape() == SHAPE_CAP {
+            let r = self.a[3];
+            let lo = [0, 1, 2].map(|i| self.a[i].min(self.b[i]) - r);
+            let hi = [0, 1, 2].map(|i| self.a[i].max(self.b[i]) + r);
+            return (lo, hi);
+        }
         let c = [self.a[0], self.a[1], self.a[2]];
         let h = if self.shape() == SHAPE_CYL {
             [self.b[0], self.b[1], self.b[0]]
@@ -155,11 +171,29 @@ impl Prim {
         ([c[0] - h[0], c[1] - h[1], c[2] - h[2]], [c[0] + h[0], c[1] + h[1], c[2] + h[2]])
     }
 
+    /// Сдвинуть форму (у капсулы двигаются оба конца).
+    pub fn translate(&mut self, d: V3) {
+        for i in 0..3 {
+            self.a[i] += d[i];
+            if self.shape() == SHAPE_CAP {
+                self.b[i] += d[i];
+            }
+        }
+    }
+
     /// Расстояние со знаком от точки до формы.
     #[inline]
     pub fn sd(&self, p: V3) -> f32 {
         let q = [p[0] - self.a[0], p[1] - self.a[1], p[2] - self.a[2]];
         match self.shape() {
+            SHAPE_CAP => {
+                let ba = [self.b[0] - self.a[0], self.b[1] - self.a[1], self.b[2] - self.a[2]];
+                let bb = ba[0] * ba[0] + ba[1] * ba[1] + ba[2] * ba[2];
+                let h =
+                    if bb > 0.0 { ((q[0] * ba[0] + q[1] * ba[1] + q[2] * ba[2]) / bb).clamp(0.0, 1.0) } else { 0.0 };
+                let d = [q[0] - ba[0] * h, q[1] - ba[1] * h, q[2] - ba[2] * h];
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() - self.a[3]
+            }
             SHAPE_CYL => {
                 let dx = (q[0] * q[0] + q[2] * q[2]).sqrt() - self.b[0];
                 let dy = q[1].abs() - self.b[1];
@@ -181,7 +215,7 @@ impl Scene {
         let mut solid = p[1]; // земля
         let mut cut = f32::MAX;
         let mut detail = f32::MAX;
-        for pr in &self.prims {
+        for pr in self.prims.iter().filter(|pr| pr.k[0] & NO_COLLIDE == 0) {
             let d = pr.sd(p);
             match pr.group() {
                 1 => cut = cut.min(d),
@@ -231,8 +265,18 @@ impl Accel {
         let near: Vec<usize> = (0..scene.prims.len()).filter(|&i| scene.prims[i].group() != 3).collect();
         let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
         let mut top: f32 = 0.0;
-        for p in &scene.prims {
-            let (a, b) = p.aabb();
+        let bounds = |i: usize| -> (V3, V3) {
+            let (mut a, mut b) = scene.prims[i].aabb();
+            for &(k, lo, hi) in &scene.envelopes {
+                if k == i {
+                    a = [0, 1, 2].map(|j| a[j].min(lo[j]));
+                    b = [0, 1, 2].map(|j| b[j].max(hi[j]));
+                }
+            }
+            (a, b)
+        };
+        for (i, p) in scene.prims.iter().enumerate() {
+            let (a, b) = bounds(i);
             top = top.max(b[1]);
             if p.group() != 3 {
                 lo = [lo[0].min(a[0]), lo[1].min(a[2])];
@@ -250,7 +294,7 @@ impl Accel {
         let mut cells: Vec<[Vec<u32>; 3]> = (0..nx * nz).map(|_| [vec![], vec![], vec![]]).collect();
         for &i in &near {
             let p = &scene.prims[i];
-            let (a, b) = p.aabb();
+            let (a, b) = bounds(i);
             let x0 = ((a[0] - origin[0]) / cell).floor().max(0.0) as u32;
             let x1 = (((b[0] - origin[0]) / cell).floor() as u32).min(nx - 1);
             let z0 = ((a[2] - origin[1]) / cell).floor().max(0.0) as u32;
@@ -302,6 +346,8 @@ mod tests {
             time_of_day: 0.5,
             fog: 0.0,
             triggers: vec![],
+            envelopes: vec![],
+            moon: None,
         };
         // внутри комнаты — свободно, до стены 1.5
         assert!((s.sdf([0.0, 2.0, 0.0]) - 1.5).abs() < 1e-5);

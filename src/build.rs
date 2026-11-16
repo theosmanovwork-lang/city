@@ -1,8 +1,11 @@
 //! Строитель сцен: параметрические детали города, описанные кодом.
 //! Единицы — метры; Y вверх; земля (асфальт) — плоскость y = 0.
 
-use crate::sdf::{Group, Mat, PointLight, Prim, SHAPE_BOX, SHAPE_CYL, Scene, Trigger, V3, facade, mat};
+use crate::sdf::{
+    Group, Mat, NO_COLLIDE, PointLight, Prim, SHAPE_BOX, SHAPE_CAP, SHAPE_CYL, Scene, Trigger, V3, facade, mat,
+};
 use crate::subtitles::Line;
+use std::ops::Range;
 
 // ---------------------------------------------------------------- размеры (реальные)
 pub const SIDEWALK_H: f32 = 0.15;
@@ -78,6 +81,8 @@ impl Builder {
                 time_of_day: 0.8,
                 fog: 0.004,
                 triggers: Vec::new(),
+                envelopes: Vec::new(),
+                moon: None,
             },
             seed: 1,
         }
@@ -85,6 +90,34 @@ impl Builder {
 
     pub fn finish(self) -> Scene {
         self.scene
+    }
+
+    /// Текущее число форм (начало диапазона для `since`).
+    pub fn mark(&self) -> usize {
+        self.scene.prims.len()
+    }
+    /// Диапазон форм, добавленных после `mark`.
+    pub fn since(&self, mark: usize) -> Range<usize> {
+        mark..self.scene.prims.len()
+    }
+    /// Формы будут двигаться: расширить их габариты для сетки ускорения на сдвиги `lo..hi`.
+    pub fn moving(&mut self, r: Range<usize>, lo: V3, hi: V3) {
+        for i in r {
+            let (a, b) = self.scene.prims[i].aabb();
+            let mn = [0, 1, 2].map(|k| a[k] + lo[k].min(0.0));
+            let mx = [0, 1, 2].map(|k| b[k] + hi[k].max(0.0));
+            self.scene.envelopes.push((i, mn, mx));
+        }
+    }
+    /// Формы не участвуют в коллизиях.
+    pub fn no_collide(&mut self, r: Range<usize>) {
+        for i in r {
+            self.scene.prims[i].k[0] |= NO_COLLIDE;
+        }
+    }
+    pub fn moon(&mut self, dir: V3, radius_deg: f32) {
+        let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        self.scene.moon = Some((dir.map(|v| v / l), radius_deg.to_radians()));
     }
 
     pub fn spawn(&mut self, feet: V3, yaw_deg: f32) {
@@ -134,6 +167,110 @@ impl Builder {
     pub fn cyl(&mut self, g: Group, base: V3, r: f32, h: f32, m: Mat) {
         let p = self.prim(g, SHAPE_CYL, [base[0], base[1] + h * 0.5, base[2]], [r, h * 0.5, 0.0], 0.0, m);
         self.scene.prims.push(p);
+    }
+
+    /// Капсула от `a` до `b` радиуса `r` (при a = b — шар).
+    pub fn capsule(&mut self, g: Group, a: V3, b: V3, r: f32, m: Mat) {
+        self.seed = self.seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+        self.scene.prims.push(Prim {
+            a: [a[0], a[1], a[2], r],
+            b: [b[0], b[1], b[2], 0.0],
+            m: m.p,
+            k: [SHAPE_CAP | ((g as u32) << 8), m.id, m.style, self.seed >> 8],
+        });
+    }
+
+    // ------------------------------------------------------------ люди
+    /// Параметрический человек: ноги в `feet`, взгляд по `yaw` (рад, 0 — вдоль +Z).
+    /// Возвращает диапазон форм (для движения и флагов).
+    pub fn person(&mut self, feet: V3, yaw: f32, look: &Look, pose: Pose) -> Range<usize> {
+        let start = self.mark();
+        let (s, c) = yaw.sin_cos();
+        // локальные координаты: x — вправо, y — вверх, z — вперёд
+        let w = |p: V3| [feet[0] + p[0] * c + p[2] * s, feet[1] + p[1], feet[2] - p[0] * s + p[2] * c];
+        let g = Group::Detail;
+        let cloth = |col: V3| Mat::rgb(mat::VINYL, col);
+        let matte = |col: V3| Mat::rgb(mat::PLASTER, col);
+        let k = if look.female { 0.93 } else { 1.0 };
+        let hip = 0.9 * k;
+        let sh = 1.42 * k;
+        let head = 1.65 * k;
+        // ноги и обувь
+        for x in [-0.1f32, 0.1] {
+            let x = x * k;
+            self.capsule(g, w([x, hip, 0.0]), w([x, 0.5 * k, 0.03]), 0.075, cloth(look.pants));
+            self.capsule(g, w([x, 0.5 * k, 0.03]), w([x, 0.1, 0.0]), 0.06, cloth(look.pants));
+            self.capsule(g, w([x, 0.06, -0.03]), w([x, 0.06, 0.12]), 0.055, matte(look.shoes));
+        }
+        // таз, торс, плечи
+        self.capsule(g, w([-0.09 * k, hip + 0.04, 0.0]), w([0.09 * k, hip + 0.04, 0.0]), 0.11 * k, cloth(look.pants));
+        let torso_r = if look.female { 0.145 } else { 0.17 };
+        self.capsule(g, w([0.0, hip + 0.1, 0.0]), w([0.0, sh - 0.06, 0.0]), torso_r, cloth(look.top));
+        self.capsule(g, w([-0.17 * k, sh, 0.0]), w([0.17 * k, sh, 0.0]), 0.075, cloth(look.top));
+        // шея и голова
+        self.capsule(g, w([0.0, sh + 0.04, 0.0]), w([0.0, head - 0.09, 0.0]), 0.05, matte(look.skin));
+        self.capsule(g, w([0.0, head, 0.0]), w([0.0, head, 0.0]), 0.11, matte(look.skin));
+        // причёска
+        match look.hair {
+            Hair::Bald => {}
+            Hair::Short => self.capsule(
+                g,
+                w([0.0, head + 0.03, -0.02]),
+                w([0.0, head + 0.03, -0.02]),
+                0.112,
+                matte(look.hair_color),
+            ),
+            Hair::Long => {
+                self.capsule(
+                    g,
+                    w([0.0, head + 0.03, -0.02]),
+                    w([0.0, head + 0.03, -0.02]),
+                    0.115,
+                    matte(look.hair_color),
+                );
+                self.capsule(g, w([0.0, head - 0.02, -0.07]), w([0.0, sh - 0.02, -0.09]), 0.1, matte(look.hair_color));
+            }
+            Hair::Hat => {
+                self.cyl(g, w([0.0, head + 0.06, 0.0]), 0.18, 0.02, matte(look.hair_color));
+                self.cyl(g, w([0.0, head + 0.06, 0.0]), 0.12, 0.13, matte(look.hair_color));
+            }
+        }
+        // руки
+        let arm = cloth(look.top);
+        match pose {
+            Pose::Stand => {
+                for x in [-1.0f32, 1.0] {
+                    let elbow = w([x * 0.22 * k, sh - 0.3, 0.02]);
+                    self.capsule(g, w([x * 0.19 * k, sh, 0.0]), elbow, 0.055, arm);
+                    self.capsule(g, elbow, w([x * 0.23 * k, sh - 0.6, 0.05]), 0.05, arm);
+                }
+            }
+            Pose::Aim => {
+                // правая рука вытянута вперёд, левая поддерживает
+                let hand = [0.05, sh - 0.02, 0.62];
+                self.capsule(g, w([0.19 * k, sh, 0.0]), w(hand), 0.055, arm);
+                self.capsule(g, w([-0.19 * k, sh, 0.0]), w([0.0, sh - 0.06, 0.56]), 0.05, arm);
+                self.capsule(g, w(hand), w(hand), 0.045, matte(look.skin));
+                let steel = Mat::rgb(mat::METAL, [0.05, 0.05, 0.055]);
+                self.capsule(
+                    g,
+                    w([hand[0], hand[1] + 0.05, hand[2] - 0.03]),
+                    w([hand[0], hand[1] + 0.06, hand[2] + 0.17]),
+                    0.028,
+                    steel,
+                );
+                self.capsule(
+                    g,
+                    w([hand[0], hand[1] + 0.02, hand[2]]),
+                    w([hand[0], hand[1] - 0.06, hand[2] - 0.02]),
+                    0.025,
+                    steel,
+                );
+            }
+        }
+        let r = self.since(start);
+        let _ = start;
+        r
     }
 
     /// Невидимое препятствие (стекло витрины).
@@ -341,4 +478,32 @@ impl Builder {
             Mat::glow(pal::WARM_BULB, 2.0),
         );
     }
+}
+
+// ---------------------------------------------------------------- внешность людей
+#[derive(Clone, Copy)]
+pub enum Hair {
+    Bald,
+    Short,
+    Long,
+    Hat,
+}
+
+#[derive(Clone, Copy)]
+pub enum Pose {
+    Stand,
+    /// Целится вперёд (пистолет в вытянутой руке).
+    Aim,
+}
+
+/// Внешность: пол, причёска, одежда. Люди отличаются только этим.
+#[derive(Clone, Copy)]
+pub struct Look {
+    pub female: bool,
+    pub skin: V3,
+    pub hair: Hair,
+    pub hair_color: V3,
+    pub top: V3,
+    pub pants: V3,
+    pub shoes: V3,
 }

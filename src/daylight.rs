@@ -46,7 +46,8 @@ fn smooth(a: f32, b: f32, x: f32) -> f32 {
 
 impl Daylight {
     /// `t` — время суток 0..1 (0 — полночь, 0.5 — полдень).
-    pub fn at(t: f32) -> Daylight {
+    /// `moon` — направление ночного светила, если сцена его задаёт.
+    pub fn at(t: f32, moon: Option<[f32; 3]>) -> Daylight {
         use std::f32::consts::TAU;
         let ang = (t - 0.25) * TAU; // 0 — восход, π/2 — полдень
         let e = ang.sin() * MAX_SUN_ELEV_DEG.to_radians().sin();
@@ -72,7 +73,7 @@ impl Daylight {
         let (dir, col, kk) = if sun_k > 0.02 {
             (sun, sun_col, sun_k)
         } else {
-            let m = [-0.35_f32, 0.8, 0.45];
+            let m = moon.unwrap_or([-0.35, 0.8, 0.45]);
             let l = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
             (m.map(|v| v / l), MOON, MOON_K * night_k)
         };

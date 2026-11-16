@@ -83,6 +83,12 @@ pub struct FrameUniform {
     pub ramp: [[u32; 4]; 8],
     pub accel_o: [f32; 4],
     pub accel_n: [u32; 4],
+    /// Эффекты: затемнение, засветка, виньетка, вспышка.
+    pub fx: [f32; 4],
+    /// Свечение (сила, порог), подсветка фона, косинус радиуса диска луны.
+    pub fx2: [f32; 4],
+    /// Радиус свечения в ячейках (x).
+    pub fx3: [f32; 4],
     pub lights: [[f32; 4]; 32],
 }
 
@@ -106,7 +112,8 @@ struct SceneGpu {
     ranges: wgpu::Buffer,
     list: wgpu::Buffer,
     frame: wgpu::Buffer,
-    out: Option<(LayerGpu, wgpu::BindGroup)>,
+    /// Выходная сетка, промежуточный цвет, группы привязок проходов march и post.
+    out: Option<(LayerGpu, wgpu::Texture, wgpu::BindGroup, wgpu::BindGroup)>,
 }
 
 pub struct Renderer {
@@ -119,6 +126,8 @@ pub struct Renderer {
     layout: wgpu::BindGroupLayout,
     march: wgpu::ComputePipeline,
     march_layout: wgpu::BindGroupLayout,
+    post: wgpu::ComputePipeline,
+    post_layout: wgpu::BindGroupLayout,
     atlas_view: wgpu::TextureView,
     atlas_origin_y: [u32; 3],
     layers: Vec<LayerGpu>,
@@ -281,23 +290,35 @@ impl Renderer {
                 buf_entry(1, ro, comp),
                 buf_entry(2, ro, comp),
                 buf_entry(3, ro, comp),
+                storage_tex(7, wgpu::TextureFormat::Rgba16Float),
+            ],
+        });
+        let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post"),
+            entries: &[
+                buf_entry(0, wgpu::BufferBindingType::Uniform, comp),
                 storage_tex(4, wgpu::TextureFormat::R32Uint),
                 storage_tex(5, wgpu::TextureFormat::Rgba8Unorm),
                 storage_tex(6, wgpu::TextureFormat::Rgba8Unorm),
+                tex_entry(8, unfilterable, comp),
             ],
         });
-        let march = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("march"),
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("march"),
-                bind_group_layouts: &[Some(&march_layout)],
-                immediate_size: 0,
-            })),
-            module: &march_shader,
-            entry_point: Some("cs_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let compute = |label, layout: &wgpu::BindGroupLayout, entry| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some(label),
+                    bind_group_layouts: &[Some(layout)],
+                    immediate_size: 0,
+                })),
+                module: &march_shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let march = compute("march", &march_layout, "cs_march");
+        let post = compute("post", &post_layout, "cs_post");
 
         let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("atlas"),
@@ -323,6 +344,8 @@ impl Renderer {
             layout,
             march,
             march_layout,
+            post,
+            post_layout,
             layers: Vec::new(),
             scene: None,
             adapter_info,
@@ -344,7 +367,7 @@ impl Renderer {
             self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
                 contents: bytes,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             })
         };
         let prims = if scene.prims.is_empty() { vec![bytemuck::Zeroable::zeroed()] } else { scene.prims.clone() };
@@ -361,6 +384,15 @@ impl Renderer {
             out: None,
         };
         self.scene = Some(gpu);
+    }
+
+    /// Обновить формы сцены на GPU (подвижная геометрия).
+    pub fn update_prims(&mut self, prims: &[crate::sdf::Prim]) {
+        if let Some(g) = &self.scene
+            && !prims.is_empty()
+        {
+            self.queue.write_buffer(&g.prims, 0, bytemuck::cast_slice(prims));
+        }
     }
 
     /// Нарисовать кадр в окно.
@@ -470,12 +502,26 @@ impl Renderer {
                     .scene
                     .as_ref()
                     .and_then(|g| g.out.as_ref())
-                    .is_none_or(|(o, _)| o.cols != s.cols || o.rows != s.rows);
+                    .is_none_or(|(o, ..)| o.cols != s.cols || o.rows != s.rows);
                 if need {
                     let out = self.create_layer(s.cols, s.rows, true);
+                    let color = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("scene-color"),
+                        size: wgpu::Extent3d { width: s.cols, height: s.rows, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+                    let cv = color.create_view(&Default::default());
                     let gpu = self.scene.as_ref().expect("сцена");
                     let views = [&out.glyph, &out.fg, &out.bg].map(|t| t.create_view(&Default::default()));
-                    let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    fn tv(b: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+                        wgpu::BindGroupEntry { binding: b, resource: wgpu::BindingResource::TextureView(v) }
+                    }
+                    let bind_march = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("march"),
                         layout: &self.march_layout,
                         entries: &[
@@ -483,35 +529,36 @@ impl Renderer {
                             wgpu::BindGroupEntry { binding: 1, resource: gpu.prims.as_entire_binding() },
                             wgpu::BindGroupEntry { binding: 2, resource: gpu.ranges.as_entire_binding() },
                             wgpu::BindGroupEntry { binding: 3, resource: gpu.list.as_entire_binding() },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: wgpu::BindingResource::TextureView(&views[0]),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 5,
-                                resource: wgpu::BindingResource::TextureView(&views[1]),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 6,
-                                resource: wgpu::BindingResource::TextureView(&views[2]),
-                            },
+                            tv(7, &cv),
                         ],
                     });
-                    self.scene.as_mut().expect("сцена").out = Some((out, bg));
+                    let bind_post = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("post"),
+                        layout: &self.post_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: gpu.frame.as_entire_binding() },
+                            tv(4, &views[0]),
+                            tv(5, &views[1]),
+                            tv(6, &views[2]),
+                            tv(8, &cv),
+                        ],
+                    });
+                    self.scene.as_mut().expect("сцена").out = Some((out, color, bind_march, bind_post));
                 }
                 let p = self.params(&s.view, s.cols, s.rows);
                 let gpu = self.scene.as_ref().expect("сцена");
-                let (out, bind) = gpu.out.as_ref().expect("выход сцены");
+                let (out, _, bind_march, bind_post) = gpu.out.as_ref().expect("выход сцены");
                 self.queue.write_buffer(&gpu.frame, 0, bytemuck::bytes_of(s.frame));
                 self.queue.write_buffer(&out.params, 0, bytemuck::bytes_of(&p));
-                {
+                let groups = (s.cols.div_ceil(8), s.rows.div_ceil(8));
+                for (pipe, bind, label) in [(&self.march, bind_march, "march"), (&self.post, bind_post, "post")] {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("march"),
+                        label: Some(label),
                         timestamp_writes: None,
                     });
-                    pass.set_pipeline(&self.march);
+                    pass.set_pipeline(pipe);
                     pass.set_bind_group(0, bind, &[]);
-                    pass.dispatch_workgroups(s.cols.div_ceil(8), s.rows.div_ceil(8), 1);
+                    pass.dispatch_workgroups(groups.0, groups.1, 1);
                 }
                 Some(s.view)
             }
@@ -546,7 +593,7 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             };
             if let (Some(v), Some(gpu)) = (scene_view, &self.scene)
-                && let Some((out, _)) = &gpu.out
+                && let Some((out, ..)) = &gpu.out
             {
                 draw(&mut pass, &v, &out.bind_group);
             }

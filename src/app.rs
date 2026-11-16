@@ -6,6 +6,7 @@ use crate::config::{Config, Preset};
 use crate::daylight::{Daylight, clock};
 use crate::font::{Atlas, Font, FontId, GLYPH_COUNT, glyph_char, glyph_index};
 use crate::grid::{Grid, Rgba8, rgb};
+use crate::logic::{Ctx, Flow, Fx, Logic};
 use crate::player::{Input, Player};
 use crate::renderer::{FrameUniform, Layer, MAX_LIGHTS, ScenePass, View};
 use crate::sdf::{Accel, Scene};
@@ -56,6 +57,11 @@ pub struct App {
     pub scene: Scene,
     pub accel: Accel,
     pub player: Player,
+    pub scene_name: String,
+    logic: Box<dyn Logic>,
+    pub fx: Fx,
+    /// Номер попытки прохождения локации (с 1).
+    pub attempt: u32,
     held: [bool; 5],
     pub subtitles: Subtitles,
     size: (u32, u32),
@@ -69,7 +75,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config, scene: Scene) -> App {
+    pub fn new(cfg: Config, scene_name: &str) -> App {
+        let (scene, logic) = crate::scenes::load(scene_name, 1);
         let accel = Accel::build(&scene, cfg.accel_cell);
         log::info!(
             "сцена «{}»: {} форм, сетка ускорения {}x{}, до {} форм в ячейке",
@@ -96,6 +103,10 @@ impl App {
             scene,
             accel,
             player,
+            scene_name: scene_name.to_string(),
+            logic,
+            fx: Fx::default(),
+            attempt: 1,
             held: [false; 5],
             subtitles: Subtitles::default(),
             size: (1, 1),
@@ -169,7 +180,9 @@ impl App {
             strafe: h[Move::Right as usize] as i32 as f32 - h[Move::Left as usize] as i32 as f32,
             run: h[Move::Run as usize],
         };
-        self.player.update(dtf, input, &self.scene, &self.cfg);
+        // замедление времени из сценария действует на игрока, но не на мышь и не на субтитры
+        let sdt = dtf * self.fx.time_scale;
+        self.player.update(sdt, input, &self.scene, &self.cfg);
         let p = self.player.pos;
         let mut fired = Vec::new();
         for t in &mut self.scene.triggers {
@@ -179,7 +192,30 @@ impl App {
             }
         }
         self.subtitles.push(&fired);
+        let flow = self.logic.update(&mut Ctx {
+            scene: &mut self.scene,
+            player: &mut self.player,
+            subs: &mut self.subtitles,
+            fx: &mut self.fx,
+            input,
+            dt: dtf,
+        });
         self.subtitles.update(dtf, self.cfg.subtitle_gap_s);
+        if flow == Flow::Restart {
+            self.restart();
+        }
+    }
+
+    /// Начать локацию заново: сцена, игрок, сценарий, эффекты, субтитры.
+    pub fn restart(&mut self) {
+        self.attempt += 1;
+        let (scene, logic) = crate::scenes::load(&self.scene_name, self.attempt);
+        self.player = Player::new(scene.spawn.0, scene.spawn.1);
+        self.day_t = scene.time_of_day;
+        self.scene = scene;
+        self.logic = logic;
+        self.fx = Fx::default();
+        self.subtitles = Subtitles::default();
     }
 
     /// Параметры вывода для пресета в прямоугольнике rect (сетка по центру).
@@ -242,7 +278,7 @@ impl App {
         self.scene_grid = (cols, rows);
         self.scene_view = Some(view);
         let c = &self.cfg;
-        let d = Daylight::at(self.day_t);
+        let d = Daylight::at(self.day_t, self.scene.moon.map(|m| m.0));
         let eye = self.player.eye(c);
         let fwd = self.player.forward();
         let (s, co) = self.player.yaw.sin_cos();
@@ -253,7 +289,7 @@ impl App {
             fwd[2] * right[0] - fwd[0] * right[2],
             fwd[0] * right[1] - fwd[1] * right[0],
         ];
-        let tan_y = (c.fov_y_deg.to_radians() * 0.5).tan();
+        let tan_y = (c.fov_y_deg.to_radians() * 0.5).tan() * self.fx.fov_mul;
         let aspect = (cols * view.cell.0) as f32 / (rows.max(1) * view.cell.1) as f32;
         let tan_x = tan_y * aspect;
         let ss = ((view.cell.1 as f32 / c.supersample_cell_px).round() as u32).clamp(1, 4);
@@ -297,6 +333,9 @@ impl App {
             ramp,
             accel_o: [a.origin[0], a.origin[1], a.cell, a.top],
             accel_n: [a.nx, a.nz, a.far.0, a.far.1],
+            fx: [self.fx.fade, self.fx.white, self.fx.vignette, self.fx.flash],
+            fx2: [c.bloom, c.bloom_threshold, view.bg_gain, self.scene.moon.map_or(c.moon_disc_cos, |m| m.1.cos())],
+            fx3: [(cols as f32 * c.bloom_radius_per_100 / 100.0).round().max(2.0), 0.0, 0.0, 0.0],
             lights: lu,
         };
     }
@@ -315,7 +354,7 @@ impl App {
             g.fg.fill([0; 4]);
             g.bg.fill([0; 4]);
         }
-        self.subtitles.draw(&mut g, &self.cfg);
+        self.subtitles.draw(&mut g, &self.cfg, self.fx.white);
         if self.grab_hint {
             let s = "Щёлкните мышью, чтобы управлять";
             let x = (cols as i32 - s.chars().count() as i32) / 2;
@@ -337,7 +376,7 @@ impl App {
         let fps = self.fps.map_or("--".to_string(), |f| format!("{f:.0}"));
         let pos = self.player.pos;
         let lines = [
-            format!(" ASCII CITY | этап 2 | {fps} к/с "),
+            format!(" ASCII CITY | {fps} к/с "),
             format!(
                 " сетка {cols}x{rows} = {} | клетка {}x{} px (глиф {}x{} x{} + зазор {}) | пресет {} ",
                 cols * rows,
@@ -350,13 +389,15 @@ impl App {
                 p.name
             ),
             format!(
-                " {} | {}{} | x {:.1} y {:.2} z {:.1} ",
+                " {} #{} | {}{} | x {:.1} y {:.2} z {:.1} | {} ",
                 self.scene.name,
+                self.attempt,
                 clock(self.day_t),
                 if self.fast { " >>" } else { "" },
                 pos[0],
                 pos[1],
-                pos[2]
+                pos[2],
+                self.logic.state()
             ),
             " WASD, мышь, Shift - бег | +/- плотность | G зазор | B фон | [ ] время | T ход времени ".to_string(),
             " F1 шрифты | F3 скрыть | F11 экран | Esc мышь/выход ".to_string(),
@@ -454,5 +495,63 @@ impl App {
         if zoomed {
             g.text(0, g.rows as i32 - 1, "(zoomed)", dim);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sim(app: &mut App, moves: &[Move], secs: f64) {
+        app.release_all();
+        for &m in moves {
+            app.hold(m, true);
+        }
+        let step = 1.0 / 60.0;
+        for _ in 0..(secs / step) as u32 {
+            app.update(step);
+        }
+        app.release_all();
+    }
+
+    #[test]
+    fn alley_run_reaches_light_without_shot() {
+        let mut app = App::new(Config::default(), "alley");
+        sim(&mut app, &[], 1.0);
+        sim(&mut app, &[Move::Forward, Move::Run], 14.0);
+        assert_eq!(app.attempt, 1, "бегущего не застрелили");
+        assert!(app.fx.white > 0.5, "дошли до света: белое {}", app.fx.white);
+        // в узком месте проход не заклинивает: игрок дальше 35 м
+        assert!(app.player.pos[2] > 35.0, "протиснулись: z = {}", app.player.pos[2]);
+        sim(&mut app, &[], 8.0);
+        assert_eq!(app.attempt, 2, "после пробуждения сон начинается заново");
+    }
+
+    #[test]
+    fn alley_idle_gets_shot() {
+        let mut app = App::new(Config::default(), "alley");
+        sim(&mut app, &[], 12.5);
+        assert_eq!(app.attempt, 2, "стоял — выстрел и сон заново");
+    }
+
+    #[test]
+    fn alley_backing_off_gets_shot() {
+        let mut app = App::new(Config::default(), "alley");
+        sim(&mut app, &[Move::Back], 4.0);
+        assert_eq!(app.attempt, 2, "пятился к стрелку — выстрел");
+    }
+
+    #[test]
+    fn alley_walking_does_not_bring_light_closer() {
+        let mut app = App::new(Config::default(), "alley");
+        let before = app.logic.state();
+        sim(&mut app, &[Move::Forward], 6.0);
+        let after = app.logic.state();
+        let dist = |s: &str| -> f32 {
+            let i = s.find("до фонаря ").expect("состояние") + "до фонаря ".len();
+            s[i..].split(' ').next().unwrap().parse().unwrap()
+        };
+        assert!((dist(&before) - dist(&after)).abs() < 0.2, "{before} -> {after}");
+        assert!(app.player.pos[2] > 7.0, "но игрок прошёл: z = {}", app.player.pos[2]);
     }
 }

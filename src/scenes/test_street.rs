@@ -5,7 +5,7 @@
 //! известняковое здание; справа — кирпичный дом, дайнер с залом внутри и
 //! стеклянная башня. В конце — перекрёсток с авеню, дальше — силуэт даунтауна.
 
-use crate::build::{Builder, Facade, SIDEWALK_H, pal};
+use crate::build::{Builder, Facade, Hair, Look, Pose, SIDEWALK_H, pal};
 use crate::sdf::{Group, Mat, Scene, mat};
 use crate::subtitles::line;
 
@@ -196,6 +196,30 @@ fn diner(b: &mut Builder, fx: f32, z0: f32, z1: f32) {
             );
         }
     }
+    // люди: официантка за стойкой и двое посетителей
+    let waitress = Look {
+        female: true,
+        skin: [0.62, 0.45, 0.36],
+        hair: Hair::Long,
+        hair_color: [0.35, 0.16, 0.06],
+        top: [0.55, 0.62, 0.66],
+        pants: [0.12, 0.12, 0.14],
+        shoes: [0.9, 0.9, 0.88],
+    };
+    b.person([cx + 1.4, SIDEWALK_H, zd + 1.0], -90f32.to_radians(), &waitress, Pose::Stand);
+    let guest = Look {
+        female: false,
+        skin: [0.45, 0.30, 0.22],
+        hair: Hair::Short,
+        hair_color: [0.05, 0.04, 0.03],
+        top: [0.30, 0.18, 0.10],
+        pants: [0.10, 0.14, 0.25],
+        shoes: [0.08, 0.06, 0.05],
+    };
+    b.person([cx - 1.1, SIDEWALK_H, z0 + 4.8], 90f32.to_radians(), &guest, Pose::Stand);
+    let old = Look { hair: Hair::Bald, skin: [0.70, 0.55, 0.45], top: [0.25, 0.27, 0.22], ..guest };
+    b.person([ix0 + 2.2, SIDEWALK_H, z1 - 4.6], -90f32.to_radians(), &old, Pose::Stand);
+
     // светильники и свет в зале
     for zl in [z0 + 3.5, zd, z1 - 3.5] {
         for xl in [fx + 4.0, fx + 9.0] {

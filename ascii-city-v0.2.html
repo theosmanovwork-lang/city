@@ -1,0 +1,1202 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ASCII City — прототип 0.2 (высокая детализация)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+'use strict';
+/* ============================================================================
+   ASCII CITY — прототип 0.2 «максимальная детализация»
+
+   Конвейер кадра:
+     1. Свет: статическая карта освещения (фонари, витрины) + динамика (фары).
+     2. Raycasting по столбцам: небо (облака, луна, звёзды) → фасады → земля
+        → отражения в мокром асфальте (screen-space).
+     3. Спрайты: машины, пешеходы, фонари, светофоры, пар, антенны, баки,
+        билборды, летающие машины. Объёмный свет фонарей под дождём.
+     4. Дождь, HUD.
+     5. WebGL: сетка (символ, цвет символа, цвет фона) → 3 текстуры → один
+        полноэкранный шейдер берёт маску глифа из атласа.
+
+   Принцип стиля: каждая ячейка получает «настоящий» цвет освещённой
+   поверхности. Яркость кодируется ПЛОТНОСТЬЮ символа (рампа . : - = + * # @),
+   оттенок — цветом символа, а фон ячейки слегка подсвечивается тем же цветом.
+   Чем выше разрешение сетки, тем больше деталей проявляется: окна получают
+   рамы и шторы, буквы вывесок превращаются в пиксельные буквы из символов.
+   ========================================================================== */
+
+// ============================================================ НАСТРОЙКИ
+const CONFIG = {
+  resPresets: [140, 200, 260, 320, 400, 480, 600], // ширина экрана в символах (+/-)
+  resIndex: 3,
+  charAspect: 0.6,         // ширина ячейки / высота
+  fov: Math.PI / 2.6,
+  maxDist: 80,
+  eye: 0.17,               // 1 тайл ≈ 10 м
+  mapBlocks: 9, block: 14, road: 4,
+  walkSpeed: 1.4, runMul: 3.2, turnSpeed: 2.2, mouseSens: 0.0025,
+  cars: 80, peds: 160, flyers: 16, rainDrops: 1400,
+  bgFill: 0.17,            // подсветка фона ячейки цветом поверхности
+  fogDensity: 0.026,
+  reflections: 0.75,       // сила отражений в мокром асфальте
+  seed: 2077,
+};
+
+const COL = {
+  pink: [1, .22, .66], cyan: [.15, .9, 1], violet: [.68, .38, 1], amber: [1, .66, .2],
+  blue: [.3, .5, 1], green: [.35, 1, .5], red: [1, .16, .16], white: [.95, .95, 1],
+  warm: [1, .8, .5], cool: [.72, .86, 1], tv: [.35, .55, 1],
+  sodium: [1, .55, .2], led: [.7, .88, 1],
+};
+const NEONS = [COL.pink, COL.cyan, COL.violet, COL.amber, COL.blue, COL.green, COL.cyan, COL.pink, COL.red];
+const AMBIENT = [.05, .045, .095];
+const FOG = [.05, .03, .085];
+const SKY_TOP = [.008, .008, .03], SKY_HZ = [.22, .08, .28];
+const SIGN_WORDS = ['HOTEL', 'RAMEN', 'BAR', 'NEON', 'CLUB', '2077', 'DATA', 'SUSHI', 'CYBER', 'OPEN', 'BAR24', 'NOODLE', 'KARAOKE', 'MOTEL', 'TAXI', 'LIVE', 'CAFE', 'PHARMA', 'ZERO', 'VOID'];
+const AD_WORDS = ['DRINK NEON', 'NEW YOU 2.0', 'BUY MORE', 'CHROME LIFE', 'SLEEP IS OPTIONAL', 'ASCII CORP', 'UPGRADE NOW', 'NIGHT CITY'];
+
+// ============================================================ СИМВОЛЫ
+// Рампа плотности: от пустого к самому «тяжёлому» символу
+const RAMP = " .'`,:;-~+=*xoaO%#&@";
+let CHARSET = '';
+for (let c = 32; c < 127; c++) CHARSET += String.fromCharCode(c);
+CHARSET += 'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя';
+CHARSET += '█▄▀░▒▓·°—';
+const GI = new Int16Array(65536);
+for (let k = 0; k < CHARSET.length; k++) GI[CHARSET.charCodeAt(k)] = k;
+const gi = s => GI[s.charCodeAt(0)];
+const RAMP_G = [...RAMP].map(gi), RAMP_N = RAMP.length;
+const IS_RAMP = new Uint8Array(256); RAMP_G.forEach(g => IS_RAMP[g] = 1);
+const G_ = {}; for (const c of '|-_=/\\#%&@+*o.,:;\'"~()[]<>^O!') G_[c] = gi(c);
+G_.full = gi('█'); G_.lower = gi('▄'); G_.upper = gi('▀'); G_.space = 0;
+
+function rampG(L) {
+  const t = (L - 0.022) * 1.1;
+  if (t <= 0) return 0;
+  const k = 1 + (Math.sqrt(t) * (RAMP_N - 1)) | 0;
+  return RAMP_G[k >= RAMP_N ? RAMP_N - 1 : k];
+}
+
+// 5×7 пиксельный шрифт для неона: при высоком разрешении буквы рисуются «пикселями» из символов
+const FONT = {
+  A: [14,17,17,31,17,17,17], B: [30,17,17,30,17,17,30], C: [14,17,16,16,16,17,14], D: [30,17,17,17,17,17,30],
+  E: [31,16,16,30,16,16,31], F: [31,16,16,30,16,16,16], G: [14,17,16,23,17,17,15], H: [17,17,17,31,17,17,17],
+  I: [14,4,4,4,4,4,14], J: [7,2,2,2,2,18,12], K: [17,18,20,24,20,18,17], L: [16,16,16,16,16,16,31],
+  M: [17,27,21,21,17,17,17], N: [17,17,25,21,19,17,17], O: [14,17,17,17,17,17,14], P: [30,17,17,30,16,16,16],
+  Q: [14,17,17,17,21,18,13], R: [30,17,17,30,20,18,17], S: [15,16,16,14,1,1,30], T: [31,4,4,4,4,4,4],
+  U: [17,17,17,17,17,17,14], V: [17,17,17,17,17,10,4], W: [17,17,17,21,21,21,10], X: [17,17,10,4,10,17,17],
+  Y: [17,17,10,4,4,4,4], Z: [31,1,2,4,8,16,31], '0': [14,17,19,21,25,17,14], '1': [4,12,4,4,4,4,14],
+  '2': [14,17,1,2,4,8,31], '3': [31,2,4,2,1,17,14], '4': [2,6,10,18,31,2,2], '5': [31,16,30,1,1,17,14],
+  '6': [6,8,16,30,17,17,14], '7': [31,1,2,4,8,8,8], '8': [14,17,17,14,17,17,14], '9': [14,17,17,15,1,2,12],
+  '.': [0,0,0,0,0,12,12], ' ': [0,0,0,0,0,0,0],
+};
+function fontPix(ch, px, py) {
+  const f = FONT[ch];
+  if (!f || px < 0 || px > 4 || py < 0 || py > 6) return false;
+  return (f[py] >> (4 - px)) & 1;
+}
+
+// ============================================================ УТИЛИТЫ
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hash3(a, b, c) {
+  let h = Math.imul(a | 0, 374761393) ^ Math.imul(b | 0, 668265263) ^ Math.imul(c | 0, 1274126177);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function vnoise(x, y, s) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash3(xi, yi, s), b = hash3(xi + 1, yi, s), c = hash3(xi, yi + 1, s), d = hash3(xi + 1, yi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+const frac = v => v - Math.floor(v);
+const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+const smooth = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+
+// ============================================================ МИР
+const B = CONFIG.block, R = CONFIG.road, NB = CONFIG.mapBlocks, N = NB * B;
+const G0 = 0.38;                          // высота первого (торгового) этажа
+const tiles = new Uint16Array(N * N);     // 0 — открыто, >0 — id здания
+const ground = new Uint8Array(N * N);     // 0 асфальт, 1 тротуар, 2 парк, 3 двор
+const buildings = [null];
+const wrapI = v => ((v % N) + N) % N;
+const wrapF = v => v - N * Math.floor(v / N);
+const tileAt = (x, y) => tiles[wrapI(y) * N + wrapI(x)];
+const groundAt = (x, y) => ground[wrapI(y) * N + wrapI(x)];
+const manholes = new Float32Array(NB * NB * 2).fill(-1);
+
+const STYLES = [
+  { name: 'office', wpu: 4,   fh: 0.30, wx0: .10, wx1: .90, wz0: .25, wz1: .88, albedo: [.13, .13, .16] },
+  { name: 'resid',  wpu: 3,   fh: 0.33, wx0: .26, wx1: .74, wz0: .32, wz1: .86, albedo: [.16, .13, .17] },
+  { name: 'glass',  wpu: 5,   fh: 0.28, wx0: .07, wx1: 1.0, wz0: .10, wz1: 1.0, albedo: [.05, .08, .12] },
+  { name: 'brick',  wpu: 2.5, fh: 0.40, wx0: .30, wx1: .70, wz0: .26, wz1: .84, albedo: [.22, .09, .07] },
+];
+
+const statics = [];   // статические спрайты: фонари, светофоры, пар, крыши
+const LMR = 4, LMN = N * LMR;
+const lmStatic = new Float32Array(LMN * LMN * 3), lm = new Float32Array(LMN * LMN * 3);
+
+function splat(map, x, y, rad, c, inten) {
+  const cx = x * LMR, cy = y * LMR, rr = rad * LMR;
+  for (let yy = Math.floor(cy - rr); yy <= Math.ceil(cy + rr); yy++) {
+    const dy = (yy + 0.5 - cy) / rr, row = ((yy % LMN) + LMN) % LMN * LMN;
+    for (let xx = Math.floor(cx - rr); xx <= Math.ceil(cx + rr); xx++) {
+      const dx = (xx + 0.5 - cx) / rr, q = 1 - dx * dx - dy * dy;
+      if (q <= 0) continue;
+      const w = q * q * inten, k = (row + ((xx % LMN) + LMN) % LMN) * 3;
+      map[k] += c[0] * w; map[k + 1] += c[1] * w; map[k + 2] += c[2] * w;
+    }
+  }
+}
+let LR = 0, LG = 0, LB = 0;
+function sampleLM(wx, wy) {
+  const fx = wx * LMR - 0.5, fy = wy * LMR - 0.5;
+  const x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0;
+  const xa = ((x0 % LMN) + LMN) % LMN, xb = (xa + 1) % LMN;
+  const ya = ((y0 % LMN) + LMN) % LMN * LMN, yb = ((y0 + 1) % LMN + LMN) % LMN * LMN;
+  const a = (ya + xa) * 3, b = (ya + xb) * 3, c = (yb + xa) * 3, d = (yb + xb) * 3;
+  const w0 = (1 - tx) * (1 - ty), w1 = tx * (1 - ty), w2 = (1 - tx) * ty, w3 = tx * ty;
+  LR = lm[a] * w0 + lm[b] * w1 + lm[c] * w2 + lm[d] * w3;
+  LG = lm[a + 1] * w0 + lm[b + 1] * w1 + lm[c + 1] * w2 + lm[d + 1] * w3;
+  LB = lm[a + 2] * w0 + lm[b + 2] * w1 + lm[c + 2] * w2 + lm[d + 2] * w3;
+}
+
+function addBuilding(b) {
+  const id = buildings.length;
+  buildings.push(b);
+  for (let yy = b.y; yy < b.y + b.d; yy++)
+    for (let xx = b.x; xx < b.x + b.w; xx++) tiles[wrapI(yy) * N + wrapI(xx)] = id;
+  return id;
+}
+
+function generateCity(seed) {
+  const rnd = mulberry32(seed);
+  const pick = a => a[rnd() * a.length | 0];
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const lx = x % B, ly = y % B, inV = lx < R, inH = ly < R;
+    let g;
+    if (inV && inH) g = 0;
+    else if (inV) g = (lx === 0 || lx === R - 1) ? 1 : 0;
+    else if (inH) g = (ly === 0 || ly === R - 1) ? 1 : 0;
+    else g = 3;
+    ground[y * N + x] = g;
+  }
+  const S = B - R;
+  for (let by = 0; by < NB; by++) for (let bx = 0; bx < NB; bx++) {
+    const x0 = bx * B + R, y0 = by * B + R;
+    const sx = rnd() < 0.75 ? 3 + Math.floor(rnd() * (S - 5)) : S;
+    const sy = rnd() < 0.75 ? 3 + Math.floor(rnd() * (S - 5)) : S;
+    const xs = sx < S ? [[0, sx], [sx, S]] : [[0, S]];
+    const ys = sy < S ? [[0, sy], [sy, S]] : [[0, S]];
+    const dc = Math.hypot((bx + 0.5) / NB - 0.5, (by + 0.5) / NB - 0.5);
+    const central = Math.max(0, 1 - dc * 2.1);
+    for (const [ya, yb] of ys) for (const [xa, xb] of xs) {
+      const lx = x0 + xa, ly = y0 + ya, w = xb - xa, d = yb - ya;
+      if (rnd() < 0.07) {                                      // парк
+        for (let yy = ly; yy < ly + d; yy++) for (let xx = lx; xx < lx + w; xx++) {
+          ground[wrapI(yy) * N + wrapI(xx)] = 2;
+          if (rnd() < 0.3) addBuilding({ kind: 'tree', h: 0.28 + rnd() * 0.3, seed: rnd() * 1e9 | 0, x: xx, y: yy, w: 1, d: 1 });
+        }
+        continue;
+      }
+      let h = 0.75 + rnd() * 2.0;
+      if (rnd() < 0.12 + central * 0.5) h = 3.2 + rnd() * 12 * (0.35 + central);
+      const style = h > 4 ? (rnd() < 0.6 ? 2 : 0) : (rnd() < 0.45 ? 1 : rnd() < 0.5 ? 3 : 0);
+      const st = STYLES[style];
+      h = G0 + Math.max(1, Math.round((h - G0) / st.fh)) * st.fh;
+      const neon = pick(NEONS), neon2 = pick(NEONS);
+      const b = {
+        kind: 'building', style, h, neon, neon2, x: lx, y: ly, w, d, seed: rnd() * 1e9 | 0,
+        lit: style === 2 ? 0.3 + rnd() * 0.35 : 0.15 + rnd() * 0.35,
+        albedo: st.albedo.map(v => v * (0.8 + rnd() * 0.4)),
+        trim: rnd() < 0.55,
+        shop: { word: pick(SIGN_WORDS), period: 1.8 + rnd() * 1.8, on: rnd() < 0.78, col: neon2, blink: rnd() < 0.15 },
+        sign: null, ad: null,
+      };
+      if (h > G0 + 1.0 && rnd() < 0.5) {
+        const word = pick(SIGN_WORDS), lh = 0.1;
+        const need = word.length * lh + 0.08;
+        const zTop = G0 + need + 0.05 + rnd() * Math.max(0, Math.min(h - 0.12, G0 + 2.2) - G0 - need - 0.05);
+        b.sign = { word, lh, zTop, period: 2.6 + rnd() * 3, uOff: rnd() * 9, col: pick(NEONS), blink: rnd() < 0.25 };
+      }
+      if (h > 3 && rnd() < 0.5) {
+        const hgt = 0.5 + rnd() * 0.4;
+        b.ad = { word: pick(AD_WORDS), period: 5 + rnd() * 4, uOff: rnd() * 9, w: 1.4 + rnd() * 1.2,
+                 z0: G0 + 0.4 + rnd() * Math.max(0, h - G0 - 0.6 - hgt), hgt, colA: pick(NEONS), colB: pick(NEONS), speed: 0.2 + rnd() * 0.3 };
+      }
+      const id = addBuilding(b);
+      // крыши
+      if (h > 2.2 && rnd() < 0.65) {
+        const n = 1 + (rnd() * 3 | 0);
+        for (let k = 0; k < n; k++) statics.push({ type: 'antenna', x: lx + 0.3 + rnd() * (w - 0.6), y: ly + 0.3 + rnd() * (d - 0.6), z0: h, w: 0.03, h: 0.25 + rnd() * 0.9, seed: rnd() * 1e9 | 0 });
+      }
+      if (style !== 2 && h < 5 && rnd() < 0.45) statics.push({ type: 'tank', x: lx + 0.5 + rnd() * (w - 1), y: ly + 0.5 + rnd() * (d - 1), z0: h, w: 0.32, h: 0.36 });
+      if (h > 1 && h < 4.5 && rnd() < 0.22) statics.push({ type: 'billboard', x: lx + w / 2, y: ly + d / 2, z0: h + 0.02, w: Math.min(1.6, w * 0.8), h: 0.62, word: pick(SIGN_WORDS), col: pick(NEONS), col2: pick(NEONS) });
+      // свет витрин на тротуаре
+      const sc = b.shop.on ? b.shop.col : COL.warm, si = b.shop.on ? 0.55 : 0.12;
+      for (let xx = lx; xx < lx + w; xx++) {
+        if (!tileAt(xx, ly - 1)) splat(lmStatic, xx + 0.5, ly - 0.15, 0.8, sc, si);
+        if (!tileAt(xx, ly + d)) splat(lmStatic, xx + 0.5, ly + d + 0.15, 0.8, sc, si);
+      }
+      for (let yy = ly; yy < ly + d; yy++) {
+        if (!tileAt(lx - 1, yy)) splat(lmStatic, lx - 0.15, yy + 0.5, 0.8, sc, si);
+        if (!tileAt(lx + w, yy)) splat(lmStatic, lx + w + 0.15, yy + 0.5, 0.8, sc, si);
+      }
+      void id;
+    }
+  }
+  // фонари, светофоры, люки с паром
+  const lampPos = [1.6, 5, 8.4];
+  for (let by = 0; by < NB; by++) for (let bx = 0; bx < NB; bx++) {
+    const x0 = bx * B, y0 = by * B;
+    for (const o of lampPos) {
+      const pts = [[x0 + 0.82, y0 + R + o], [x0 + R - 0.82, y0 + R + o + 1.7], [x0 + R + o, y0 + 0.82], [x0 + R + o + 1.7, y0 + R - 0.82]];
+      for (const [lx, ly] of pts) {
+        const col = rnd() < 0.7 ? COL.sodium : COL.led;
+        statics.push({ type: 'lamp', x: lx, y: ly, z0: 0, w: 0.035, h: 0.5, col });
+        statics.push({ type: 'cone', x: lx, y: ly, z0: 0.02, w: 0.75, h: 0.46, col });
+        splat(lmStatic, lx, ly, 1.7, col, 1.5);
+      }
+    }
+    if (hash3(bx, by, 5) < 0.75) {
+      statics.push({ type: 'tlight', x: x0 + 0.45, y: y0 + R + 0.3, z0: 0, w: 0.05, h: 0.44, axis: 'v' });
+      statics.push({ type: 'tlight', x: x0 + R - 0.45, y: y0 - 0.3, z0: 0, w: 0.05, h: 0.44, axis: 'v' });
+      statics.push({ type: 'tlight', x: x0 - 0.3, y: y0 + 0.45, z0: 0, w: 0.05, h: 0.44, axis: 'h' });
+      statics.push({ type: 'tlight', x: x0 + R + 0.3, y: y0 + R - 0.45, z0: 0, w: 0.05, h: 0.44, axis: 'h' });
+    }
+    if (rnd() < 0.4) {
+      const mx = x0 + R / 2 + (rnd() - 0.5) * 1.6, my = y0 + R / 2 + (rnd() - 0.5) * 1.6;
+      manholes[(by * NB + bx) * 2] = mx; manholes[(by * NB + bx) * 2 + 1] = my;
+      statics.push({ type: 'steam', x: mx, y: my, z0: 0, w: 0.55, h: 1.0, seed: rnd() * 100 });
+    }
+  }
+}
+
+// ============================================================ МАШИНЫ, ЛЮДИ, ЛЕТАЮЩИЕ МАШИНЫ
+const cars = [], peds = [], flyers = [];
+function spawnAgents(seed) {
+  const rnd = mulberry32(seed ^ 0x9e3779b9);
+  const carCols = [[.8, .8, .85], [.7, .08, .08], [.1, .2, .6], [.9, .6, .1], [.05, .05, .06], [.1, .5, .55], [.5, .1, .5], [.35, .35, .4]];
+  for (let i = 0; i < CONFIG.cars; i++) {
+    const dir = rnd() < 0.5 ? 1 : -1;
+    const v = (2.4 + rnd() * 3) * dir;
+    cars.push({ axis: rnd() < 0.5 ? 'h' : 'v', fixed: (rnd() * NB | 0) * B + (dir > 0 ? 1.5 : 2.5), t: rnd() * N, v, vmax: v, col: carCols[rnd() * carCols.length | 0], taxi: rnd() < 0.12 });
+  }
+  const coatCols = [[.12, .12, .14], [.3, .05, .1], [.05, .1, .25], [.25, .22, .18], [.4, .4, .45], [.1, .25, .2]];
+  for (let i = 0; i < CONFIG.peds; i++) {
+    const dir = rnd() < 0.5 ? 1 : -1;
+    peds.push({ axis: rnd() < 0.5 ? 'h' : 'v', fixed: (rnd() * NB | 0) * B + (rnd() < 0.5 ? 0.35 + rnd() * 0.4 : R - 0.35 - rnd() * 0.4),
+                t: rnd() * N, v: (0.16 + rnd() * 0.2) * dir, coat: coatCols[rnd() * coatCols.length | 0],
+                umbrella: rnd() < 0.45 ? NEONS[rnd() * NEONS.length | 0] : null, phase: rnd() * 10 });
+  }
+  for (let i = 0; i < CONFIG.flyers; i++) {
+    const a = rnd() * Math.PI * 2, sp = 3 + rnd() * 5;
+    flyers.push({ x: rnd() * N, y: rnd() * N, z: 2.2 + rnd() * 6, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, seed: rnd() * 100 });
+  }
+}
+const agentPos = a => a.axis === 'h' ? [a.t, a.fixed] : [a.fixed, a.t];
+const agentVel = a => a.axis === 'h' ? [a.v, 0] : [0, a.v];
+
+// светофоры: фаза 0 — едут по горизонтальным улицам, 1 — по вертикальным
+const PHASE = 7;
+function lightState(axis) {      // 0 красный, 1 жёлтый, 2 зелёный
+  const p = Math.floor(time / PHASE) & 1, local = time % PHASE;
+  const green = (p === 0) === (axis === 'h');
+  if (!green) return 0;
+  return local > PHASE - 1.3 ? 1 : 2;
+}
+
+// ============================================================ ИГРОК
+const player = { x: 2 * B + 0.5, y: 2 * B + R + 2.5, a: Math.PI / 2 + 0.25, pitch: 0 };
+let dirX, dirY, planeX, planeY, rightX, rightY;
+function blocked(x, y) {
+  const r = 0.08;
+  return tileAt(Math.floor(x - r), Math.floor(y - r)) || tileAt(Math.floor(x + r), Math.floor(y - r)) ||
+         tileAt(Math.floor(x - r), Math.floor(y + r)) || tileAt(Math.floor(x + r), Math.floor(y + r));
+}
+
+// ============================================================ ЭКРАН И БУФЕРЫ
+const canvas = document.getElementById('screen');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: false });
+if (!gl) { document.body.innerHTML = '<p style="color:#fff;font:16px monospace;padding:20px">Нужен браузер с поддержкой WebGL2 (Chrome, Edge, Firefox).</p>'; throw new Error('no webgl2'); }
+
+let W, H, cw, ch, cols, rows, offX, offY, dpr;
+let glowA, glowB, glyphBuf, fgBuf, bgBuf, fgU8, bgU8, colBuf, depthBuf, wetCol;
+let planeLen, projX, projY, horizon;
+let atlasCols, texGlyph, texFg, texBg, texAtlas;
+let time = 0, flash = 0, nextFlash = 12;
+
+// --- WebGL: один полноэкранный шейдер
+const VS = `#version 300 es
+in vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }`;
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uGlyph, uFg, uBg, uAtlas;
+uniform vec2 uCell, uGrid, uOff; uniform float uH, uAtlasCols;
+out vec4 o;
+void main(){
+  vec2 p = vec2(floor(gl_FragCoord.x), uH - 1.0 - floor(gl_FragCoord.y)) - uOff;
+  vec2 c = floor(p / uCell);
+  if (c.x < 0.0 || c.y < 0.0 || c.x >= uGrid.x || c.y >= uGrid.y) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  ivec2 ci = ivec2(c);
+  float g = floor(texelFetch(uGlyph, ci, 0).r * 255.0 + 0.5);
+  vec3 fg = texelFetch(uFg, ci, 0).rgb, bg = texelFetch(uBg, ci, 0).rgb;
+  vec2 inC = p - c * uCell;
+  vec2 slot = vec2(mod(g, uAtlasCols), floor(g / uAtlasCols));
+  float m = texelFetch(uAtlas, ivec2(slot * uCell + inC), 0).r;
+  o = vec4(mix(bg, fg, m), 1.0);
+}`;
+function shader(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+const aP = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(aP); gl.vertexAttribPointer(aP, 2, gl.FLOAT, false, 0, 0);
+const U = n => gl.getUniformLocation(prog, n);
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+function makeTex(unit) {
+  const t = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+texGlyph = makeTex(0); texFg = makeTex(1); texBg = makeTex(2); texAtlas = makeTex(3);
+gl.uniform1i(U('uGlyph'), 0); gl.uniform1i(U('uFg'), 1); gl.uniform1i(U('uBg'), 2); gl.uniform1i(U('uAtlas'), 3);
+
+function buildAtlas() {
+  atlasCols = 16;
+  const ac = document.createElement('canvas');
+  ac.width = atlasCols * cw; ac.height = Math.ceil(CHARSET.length / atlasCols) * ch;
+  const c = ac.getContext('2d');
+  c.fillStyle = '#000'; c.fillRect(0, 0, ac.width, ac.height);
+  c.font = `${Math.round(ch * 0.92)}px Consolas, Menlo, "DejaVu Sans Mono", "Courier New", monospace`;
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  for (let k = 0; k < CHARSET.length; k++) {
+    const sx = (k % atlasCols) * cw, sy = ((k / atlasCols) | 0) * ch, s = CHARSET[k];
+    c.save(); c.beginPath(); c.rect(sx, sy, cw, ch); c.clip();
+    c.fillStyle = '#fff';
+    if (s === '█') c.fillRect(sx, sy, cw, ch);
+    else if (s === '▄') c.fillRect(sx, sy + (ch >> 1), cw, ch - (ch >> 1));
+    else if (s === '▀') c.fillRect(sx, sy, cw, ch >> 1);
+    else if (s === '░' || s === '▒' || s === '▓') { c.fillStyle = s === '░' ? '#444' : s === '▒' ? '#888' : '#ccc'; c.fillRect(sx, sy, cw, ch); }
+    else c.fillText(s, sx + cw / 2, sy + ch / 2 + 1);
+    c.restore();
+  }
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texAtlas);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, ac);
+}
+
+function resize() {
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  W = canvas.width = Math.floor(innerWidth * dpr); H = canvas.height = Math.floor(innerHeight * dpr);
+  const target = CONFIG.resPresets[CONFIG.resIndex];
+  cw = Math.max(3, Math.floor(W / target));
+  ch = Math.max(5, Math.round(cw / CONFIG.charAspect));
+  cols = Math.floor(W / cw); rows = Math.floor(H / ch);
+  offX = (W - cols * cw) >> 1; offY = (H - rows * ch) >> 1;
+  const n = cols * rows;
+  glyphBuf = new Uint8Array(n);
+  fgBuf = new Uint8ClampedArray(n * 4); bgBuf = new Uint8ClampedArray(n * 4);
+  fgU8 = new Uint8Array(fgBuf.buffer); bgU8 = new Uint8Array(bgBuf.buffer);
+  colBuf = new Float32Array(n * 3); glowA = new Float32Array(n * 3); glowB = new Float32Array(n * 3); depthBuf = new Float32Array(n); wetCol = new Float32Array(rows);
+  planeLen = Math.tan(CONFIG.fov / 2);
+  projX = (cols / 2) / planeLen; projY = projX * cw / ch;
+  gl.viewport(0, 0, W, H);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texGlyph);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, cols, rows, 0, gl.RED, gl.UNSIGNED_BYTE, null);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texFg);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texBg);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  buildAtlas();
+  gl.uniform2f(U('uCell'), cw, ch); gl.uniform2f(U('uGrid'), cols, rows); gl.uniform2f(U('uOff'), offX, offY);
+  gl.uniform1f(U('uH'), H); gl.uniform1f(U('uAtlasCols'), atlasCols);
+}
+
+// --- запись в ячейку: яркость → плотность символа, оттенок → цвет символа, фон — подсветка
+let bgFill = CONFIG.bgFill;
+function writeCell(i, r, g, b, glyph) {
+  if (glyph < 0) glyph = rampG(0.3 * r + 0.59 * g + 0.11 * b);
+  glyphBuf[i] = glyph;
+  const j = i * 4;
+  const m = r > g ? (r > b ? r : b) : (g > b ? g : b);
+  if (m <= 0.003) { fgBuf[j] = fgBuf[j + 1] = fgBuf[j + 2] = bgBuf[j] = bgBuf[j + 1] = bgBuf[j + 2] = 0; return; }
+  const gain = (m < 0.22 ? 4.5 : 1 / m) * 255;
+  fgBuf[j] = r * gain; fgBuf[j + 1] = g * gain; fgBuf[j + 2] = b * gain;
+  const bk = bgFill * 255;
+  bgBuf[j] = r * bk; bgBuf[j + 1] = g * bk; bgBuf[j + 2] = b * bk;
+}
+function emit(i, r, g, b, d, glyph) {
+  const k = i * 3; colBuf[k] = r; colBuf[k + 1] = g; colBuf[k + 2] = b; depthBuf[i] = d;
+  writeCell(i, r, g, b, glyph);
+}
+function emitF(i, r, g, b, d, glyph) {   // с туманом
+  const f = Math.exp(-d * CONFIG.fogDensity), q = 1 - f;
+  emit(i, r * f + FOG[0] * q, g * f + FOG[1] * q, b * f + FOG[2] * q, d, glyph);
+}
+function addCol(i, r, g, b, glyph) {       // аддитивный свет (объёмы, пар, дождь)
+  const k = i * 3;
+  const nr = colBuf[k] + r, ng = colBuf[k + 1] + g, nb = colBuf[k + 2] + b;
+  colBuf[k] = nr; colBuf[k + 1] = ng; colBuf[k + 2] = nb;
+  writeCell(i, nr, ng, nb, glyph !== undefined ? glyph : (IS_RAMP[glyphBuf[i]] ? -1 : glyphBuf[i]));
+}
+
+// ============================================================ НЕБО
+const CLOUD_H = 16;
+let lightningK = 0;
+function shadeSky(i, r, rdx, rdy, ang) {
+  const up = horizon - (r + 0.5), e = up / projY;           // ~тангенс угла возвышения
+  const t = clamp01(e * 2.0), tt = Math.pow(t, 0.55);
+  let cr = SKY_HZ[0] + (SKY_TOP[0] - SKY_HZ[0]) * tt, cg = SKY_HZ[1] + (SKY_TOP[1] - SKY_HZ[1]) * tt, cb = SKY_HZ[2] + (SKY_TOP[2] - SKY_HZ[2]) * tt;
+  // облака: плоскость на высоте CLOUD_H, подсвечены городом снизу
+  let dens = 0;
+  if (e > 0.004) {
+    const dist = (CLOUD_H - CONFIG.eye) / e;
+    if (dist < 900) {
+      const wx = player.x + rdx * dist, wy = player.y + rdy * dist;
+      const n = vnoise(wx * 0.035 + time * 0.03, wy * 0.035, 21) * 0.65 + vnoise(wx * 0.11, wy * 0.11 - time * 0.02, 22) * 0.35;
+      dens = smooth(0.48, 0.78, n) * Math.exp(-dist / 380);
+      const glow = 0.5 + 0.5 * Math.exp(-dist / 120);
+      const lit = 1 + lightningK * 6;
+      cr += (0.2 * glow * lit - cr) * dens; cg += (0.09 * glow * lit - cg) * dens; cb += (0.24 * glow * lit - cb) * dens;
+    }
+  }
+  // луна с кратерами
+  const relRow = Math.round(horizon) - r;
+  let da = ang - 0.9; da -= Math.PI * 2 * Math.round(da / (Math.PI * 2));
+  const mr = Math.max(4, cols * 0.022);
+  const mx = (da * cols / CONFIG.fov) / mr, my = ((relRow - rows * 0.45) * ch / cw) / mr;
+  const md = mx * mx + my * my;
+  if (md < 1) {
+    const nz = Math.sqrt(1 - md), lam = clamp01(-0.55 * mx + 0.35 * my + 0.75 * nz);
+    const crater = vnoise(mx * 3.5 + 10, my * 3.5, 3) < 0.38 ? 0.6 : 1;
+    const k = (0.15 + lam * 1.1) * crater * (1 - dens * 0.7);
+    emit(i, cr + 1.0 * k, cg + 0.92 * k, cb + 0.78 * k, Infinity, -1); return;
+  } else if (md < 9) {
+    const halo = 0.09 * Math.exp(-(Math.sqrt(md) - 1) * 1.5);
+    cr += halo; cg += halo * 0.9; cb += halo * 0.95;
+  }
+  // звёзды в разрывах облаков
+  const aN = ang - Math.PI * 2 * Math.floor(ang / (Math.PI * 2));
+  const angCol = Math.floor(aN * cols / CONFIG.fov);
+  const hs = hash3(angCol, relRow, 99);
+  if (dens < 0.25 && hs < 0.004 * t * 1.5) {
+    const tw = 0.4 + 0.6 * Math.abs(Math.sin(time * 2 + angCol));
+    const k = (0.4 + hs * 120) * tw;
+    emit(i, cr + k, cg + k, cb + k * 1.1, Infinity, hs < 0.0012 ? G_['*'] : hs < 0.002 ? G_['+'] : G_['.']); return;
+  }
+  emit(i, cr * 0.7, cg * 0.7, cb * 0.7, Infinity, -1);
+  writeCell(i, cr, cg, cb, rampG((0.3 * cr + 0.59 * cg + 0.11 * cb) * 0.55));
+}
+
+// ============================================================ ЗЕМЛЯ
+let rainOn = true;
+function shadeFloor(i, r, wx, wy, d) {
+  const tx = Math.floor(wx), ty = Math.floor(wy);
+  const g = groundAt(tx, ty);
+  const lx = wrapF(wx) % B, ly = wrapF(wy) % B, inV = lx < R, inH = ly < R;
+  let ar, ag, ab, glyph = -1, wet = 0, emis = 0;
+  const n1 = vnoise(wx * 4.1, wy * 4.1, 1), pud = vnoise(wx * 0.9 + 50, wy * 0.9, 2);
+  if (g === 0) {
+    const tex = 0.75 + 0.5 * n1;
+    ar = .26 * tex; ag = .26 * tex; ab = .3 * tex;
+    wet = pud > 0.56 ? 0.95 : 0.3;
+    if (inV && !inH && Math.abs(lx - R / 2) < 0.05 && frac(ly * 1.2) < 0.55) { ar = 1; ag = .7; ab = .2; glyph = G_['|']; wet *= 0.5; }
+    else if (inH && !inV && Math.abs(ly - R / 2) < 0.05 && frac(lx * 1.2) < 0.55) { ar = 1; ag = .7; ab = .2; glyph = G_['-']; wet *= 0.5; }
+    else if (inV && !inH && (ly < R + 0.7 || ly > B - 0.7) && frac(lx * 3) < 0.5) { ar = ag = ab = .9; glyph = G_['=']; wet *= 0.5; }
+    else if (inH && !inV && (lx < R + 0.7 || lx > B - 0.7) && frac(ly * 3) < 0.5) { ar = ag = ab = .9; glyph = G_['=']; wet *= 0.5; }
+    else if (inV && inH) {                                                     // люк
+      const bi = (Math.floor(wrapF(wy) / B) % NB) * NB + (Math.floor(wrapF(wx) / B) % NB);
+      const mxh = manholes[bi * 2];
+      if (mxh >= 0) {
+        const dx = lx - (mxh % B), dy = ly - (manholes[bi * 2 + 1] % B), dd = dx * dx + dy * dy;
+        if (dd < 0.045) { ar = ag = ab = dd > 0.03 ? .35 : .12; glyph = dd > 0.03 ? G_['o'] : G_['#']; wet = 0.2; }
+      }
+    }
+  } else if (g === 1) {
+    const seam = frac(wx * 2) < 0.06 || frac(wy * 2) < 0.06;
+    const curb = (inV && (lx > 0.9 && lx < 1) ) || (inV && (lx > R - 1 && lx < R - 0.9)) || (inH && (ly > 0.9 && ly < 1)) || (inH && (ly > R - 1 && ly < R - 0.9));
+    const tex = 0.8 + 0.4 * n1;
+    ar = .36 * tex; ag = .35 * tex; ab = .4 * tex;
+    if (curb) { ar = ag = ab = .7; glyph = G_['_']; }
+    else if (seam) { ar *= .6; ag *= .6; ab *= .6; glyph = G_['+']; }
+    wet = pud > 0.64 ? 0.8 : 0.12;
+  } else if (g === 2) {
+    const h = hash3(Math.floor(wx * 9), Math.floor(wy * 9), 3);
+    ar = .08 + .06 * n1; ag = .25 + .2 * n1; ab = .1;
+    glyph = h < 0.4 ? G_['"'] : h < 0.7 ? G_[','] : -1;
+  } else { ar = ag = ab = .22 * (0.8 + 0.4 * n1); }
+  sampleLM(wx, wy);
+  const amb = 1 + lightningK * 5;
+  let cr = ar * (AMBIENT[0] * amb + LR), cg = ag * (AMBIENT[1] * amb + LG), cb = ab * (AMBIENT[2] * amb + LB);
+  if (glyph === G_['|'] || glyph === G_['-'] || glyph === G_['=']) { cr += ar * 0.06; cg += ag * 0.06; cb += ab * 0.06; } // световозвращающая краска
+  // брызги дождя
+  if (rainOn && d < 14 && wet > 0.1 && hash3(Math.floor(wx * 12), Math.floor(wy * 12), Math.floor(time * 14)) < 0.012) {
+    cr += .25; cg += .28; cb += .32; glyph = hash3(tx, ty, Math.floor(time * 14)) < 0.5 ? G_['o'] : G_['.'];
+  }
+  wetCol[r] = wet;
+  emitF(i, cr, cg, cb, d, glyph);
+  void emis;
+}
+
+// ============================================================ ФАСАДЫ
+let LOD_ROWS = 0, LOD_COLS = 0; // сколько строк экрана приходится на единицу высоты у текущей поверхности
+// средняя дистанция: буква занимает несколько ячеек — рисуем её один раз, в центральной ячейке
+function letterCenter(lu, lv, lrows, lcols) {
+  return Math.abs(lv - 0.5) <= 0.5 / Math.max(1, lrows) && Math.abs(lu - 0.5) <= 0.5 / Math.max(1, lcols);
+}
+function letterPix(word, lu, lv, li) {    // lu,lv ∈ [0,1) внутри знакоместа
+  const px = Math.floor(lu * 6), py = Math.floor(lv * 8);
+  return fontPix(word[li], px, py);
+}
+function shadeFacade(i, b, z, u, d, side, nx, ny, hx, hy) {
+  let r = 0, g = 0, bl = 0, glyph = -1;
+  sampleLM(hx + nx * 0.3, hy + ny * 0.3);
+  const att = Math.exp(-z * 4.5), amb = 1 + lightningK * 5, sk = side ? 0.82 : 1;
+  const Lr = (AMBIENT[0] * amb + 0.04 + LR * att) * sk, Lg = (AMBIENT[1] * amb + 0.035 + LG * att) * sk, Lb = (AMBIENT[2] * amb + 0.07 + LB * att) * sk;
+
+  if (b.kind === 'tree') {
+    const h = hash3(Math.floor(u * 14), Math.floor(z * 40), b.seed), n = vnoise(u * 9, z * 22, b.seed & 255);
+    const k = 0.4 + n * 1.2;
+    return emitF(i, .12 * k * (Lr * 4 + LR), .35 * k * (Lg * 4 + LG), .12 * k * (Lb * 4 + LB), d, h < 0.3 ? G_['&'] : h < 0.5 ? G_['%'] : h < 0.6 ? G_['*'] : -1);
+  }
+  const st = STYLES[b.style], A = b.albedo;
+
+  // карниз и неоновый контур крыши
+  if (z > b.h - 0.03) {
+    if (b.trim) return emitF(i, b.neon[0] * 1.8, b.neon[1] * 1.8, b.neon[2] * 1.8, d, G_['=']);
+    return emitF(i, A[0] * Lr * 9, A[1] * Lg * 9, A[2] * Lb * 9, d, G_['_']);
+  }
+  // вертикальная неоновая вывеска
+  const s = b.sign;
+  if (s) {
+    const pu = frac((u + s.uOff) / s.period) * s.period, bw = 0.2, len = s.word.length;
+    const zBot = s.zTop - len * s.lh - 0.04;
+    if (pu < bw && z < s.zTop + 0.03 && z > zBot) {
+      const on = !s.blink || Math.sin(time * 5 + b.seed) > -0.5 || Math.sin(time * 23) > 0.6;
+      if (pu < 0.012 || pu > bw - 0.012 || z > s.zTop + 0.015 || z < zBot + 0.015) return emitF(i, s.col[0] * .3, s.col[1] * .3, s.col[2] * .3, d, pu < 0.012 || pu > bw - 0.012 ? G_['|'] : G_['-']);
+      const li = Math.floor((s.zTop - z) / s.lh);
+      if (li >= 0 && li < len) {
+        const lrows = s.lh * LOD_ROWS;
+        const k = on ? 1.5 : 0.12;
+        const lu = (pu - 0.02) / (bw - 0.04), lv = ((s.zTop - z) / s.lh) - li;
+        if (lrows >= 7) {                                   // крупно: пиксельные буквы из символов
+          if (letterPix(s.word, lu, lv, li)) return emitF(i, s.col[0] * k, s.col[1] * k, s.col[2] * k, d, G_['#']);
+          return emitF(i, s.col[0] * .05, s.col[1] * .05, s.col[2] * .05, d, -1);
+        }
+        if (lrows >= 1.5 && !letterCenter(lu, lv, lrows, (bw - 0.04) * LOD_COLS)) return emitF(i, s.col[0] * .06, s.col[1] * .06, s.col[2] * .06, d, -1);
+        return emitF(i, s.col[0] * k, s.col[1] * k, s.col[2] * k, d, gi(s.word[li]));
+      }
+    }
+  }
+  // рекламный экран
+  const ad = b.ad;
+  if (ad) {
+    const pu = frac((u + ad.uOff) / ad.period) * ad.period;
+    if (pu < ad.w && z > ad.z0 && z < ad.z0 + ad.hgt) {
+      const au = pu / ad.w, av = 1 - (z - ad.z0) / ad.hgt;          // av: 0 сверху
+      if (au < 0.015 || au > 0.985 || av < 0.03 || av > 0.97) return emitF(i, .25, .25, .3, d, au < 0.015 || au > 0.985 ? G_['|'] : G_['=']);
+      const wv = 0.5 + 0.5 * Math.sin(au * 6 + time * 1.3 + av * 3);
+      let cr = ad.colA[0] * wv + ad.colB[0] * (1 - wv), cg = ad.colA[1] * wv + ad.colB[1] * (1 - wv), cb = ad.colA[2] * wv + ad.colB[2] * (1 - wv);
+      let k = 0.35, gl2 = -1;
+      const lh = ad.hgt * 0.5, lw = lh * 0.75, lrows = lh * LOD_ROWS;
+      if (av > 0.25 && av < 0.75) {
+        const tx = pu + time * ad.speed, word = ad.word + '   ';
+        const li = Math.floor(tx / lw) % word.length, chv = word[li];
+        if (chv !== ' ') {
+          if (lrows >= 8) {
+            if (fontPix(chv, Math.floor(frac(tx / lw) * 6), Math.floor((av - 0.25) / 0.5 * 8))) { k = 2.0; gl2 = G_['#']; cr = cg = cb = 1; }
+          } else if (lrows >= 1 && letterCenter(frac(tx / lw), (av - 0.25) / 0.5, lrows, lw * LOD_COLS)) { k = 1.5; gl2 = gi(chv); cr = cg = cb = 1; }
+        }
+      }
+      const scan = frac(av * 40 + time * 2) < 0.15 ? 0.6 : 1;
+      return emitF(i, cr * k * scan, cg * k * scan, cb * k * scan, d, gl2);
+    }
+  }
+
+  // первый этаж: витрины, двери, горизонтальная вывеска
+  if (z < G0) {
+    const sh = b.shop, per = sh.period, pu = frac(u / per) * per;
+    if (z > G0 - 0.09) {                                               // вывеска над витриной
+      const lw = 0.075, start = 0.25, li = Math.floor((pu - start) / lw);
+      const on = sh.on && (!sh.blink || Math.sin(time * 7 + b.seed) > -0.3);
+      if (li >= 0 && li < sh.word.length) {
+        const k = on ? 1.4 : 0.1, lrows = 0.08 * LOD_ROWS;
+        const lu = ((pu - start) / lw) - li, lv = (G0 - 0.005 - z) / 0.08;
+        if (lrows >= 7) {
+          if (letterPix(sh.word, lu, lv, li)) return emitF(i, sh.col[0] * k, sh.col[1] * k, sh.col[2] * k, d, G_['#']);
+          return emitF(i, sh.col[0] * .04 + .015, sh.col[1] * .04 + .015, sh.col[2] * .04 + .015, d, -1);
+        }
+        if (lrows >= 1.5 && !letterCenter(lu, lv, lrows, lw * LOD_COLS)) return emitF(i, sh.col[0] * .05 + .01, sh.col[1] * .05 + .01, sh.col[2] * .05 + .01, d, -1);
+        return emitF(i, sh.col[0] * k, sh.col[1] * k, sh.col[2] * k, d, gi(sh.word[li]));
+      }
+      return emitF(i, A[0] * Lr * 3, A[1] * Lg * 3, A[2] * Lb * 3, d, G_['-']);
+    }
+    if (pu < 0.14) {                                                    // дверь
+      if (pu < 0.015 || pu > 0.125) return emitF(i, .2 * Lr * 5, .2 * Lg * 5, .2 * Lb * 5, d, G_['|']);
+      return emitF(i, .015, .012, .02, d, -1);
+    }
+    const wu = (pu - 0.18) / (per - 0.22), wv = 1 - z / (G0 - 0.1);
+    if (wu > 0 && wu < 1 && z > 0.04) {
+      if (!sh.on) {                                                     // закрыто: рольставни
+        return emitF(i, .2 * Lr * 4, .2 * Lg * 4, .22 * Lb * 4, d, frac(z * 45) < 0.5 ? G_['='] : G_['-']);
+      }
+      if (wu < 0.02 || wu > 0.98) return emitF(i, .3, .3, .35, d, G_['|']);
+      const shelf = frac(wv * 4) < 0.12;
+      const prod = hash3(Math.floor(u * 25), Math.floor(wv * 8), b.seed);
+      const c = shelf ? COL.white : prod < 0.3 ? b.neon : COL.warm;
+      const k = shelf ? 0.5 : 0.7 + prod * 0.6;
+      return emitF(i, c[0] * k, c[1] * k, c[2] * k, d, shelf ? G_['='] : prod < 0.15 ? G_['o'] : prod < 0.3 ? G_['+'] : -1);
+    }
+    return emitF(i, A[0] * Lr * 5, A[1] * Lg * 5, A[2] * Lb * 5, d, -1);
+  }
+
+  // верхние этажи
+  const zz = z - G0, fz = zz / st.fh, fi = Math.floor(fz), ffz = fz - fi;
+  const uu = u * st.wpu, wc = Math.floor(uu), fx = uu - wc;
+  if (b.style !== 2 && ffz < 0.07) return emitF(i, A[0] * Lr * 7, A[1] * Lg * 7, A[2] * Lb * 7, d, G_['_']); // межэтажный пояс
+
+  const inWin = fx >= st.wx0 && fx < st.wx1 && ffz >= st.wz0 && ffz < st.wz1;
+  if (b.style === 2) {                                                  // стеклянная башня
+    if (fx < 0.07) return emitF(i, .3 * Lr * 3, .32 * Lg * 3, .38 * Lb * 3, d, G_['|']);
+    if (ffz < 0.06) return emitF(i, .2 * Lr * 3, .22 * Lg * 3, .26 * Lb * 3, d, G_['-']);
+  }
+  if (inWin) {
+    const wu = (fx - st.wx0) / (st.wx1 - st.wx0), wv = 1 - (ffz - st.wz0) / (st.wz1 - st.wz0);
+    const res = LOD_ROWS * st.fh;                                       // строк на этаж
+    if (res > 9 && (wu < 0.06 || wu > 0.94)) return emitF(i, A[0] * 3 + .05, A[1] * 3 + .05, A[2] * 3 + .06, d, G_['|']);
+    if (res > 9 && (wv < 0.07 || wv > 0.93)) return emitF(i, A[0] * 3 + .05, A[1] * 3 + .05, A[2] * 3 + .06, d, G_['-']);
+    const hv = hash3(b.seed + wc * 7, fi, side);
+    let lit = hv < b.lit;
+    if (hv < 0.015) lit = Math.sin(time * 9 + wc * 3.1) > 0.1;
+    if (lit) {
+      const kind = hash3(wc, fi, b.seed + 1), k2 = hash3(wc, fi, b.seed + 2);
+      let c = kind < 0.55 ? COL.warm : kind < 0.8 ? COL.cool : kind < 0.9 ? b.neon : COL.tv;
+      let k = (kind >= 0.8 && kind < 0.9 ? 0.55 : 0.75) + 0.4 * (1 - wv);
+      if (kind >= 0.9) k *= 0.55 + 0.45 * hash3(wc, fi, Math.floor(time * 6));   // мерцающий телевизор
+      if (b.style === 2) { c = kind < 0.6 ? COL.cool : c; k *= 0.85; }
+      if (res > 6) {
+        if (k2 < 0.3 && (wu < 0.2 || wu > 0.8)) return emitF(i, c[0] * k * .45, c[1] * k * .45, c[2] * k * .45, d, wu < 0.5 ? G_[')'] : G_['(']);
+        if (k2 >= 0.3 && k2 < 0.45 && frac(wv * 7) < 0.45) return emitF(i, c[0] * k * .3, c[1] * k * .3, c[2] * k * .3, d, G_['=']);
+        if (k2 >= 0.45 && k2 < 0.53) {                                   // силуэт человека
+          const px = wu - 0.5 - (hash3(wc, fi, 9) - 0.5) * 0.3;
+          if ((wv > 0.25 && wv < 0.42 && Math.abs(px) < 0.07) || (wv >= 0.42 && Math.abs(px) < 0.16)) return emitF(i, .03, .025, .03, d, G_['#']);
+        }
+        if (k2 >= 0.53 && k2 < 0.6 && wv > 0.62 && wu < 0.32) return emitF(i, .1 * k, .45 * k, .12 * k, d, G_['&']);
+      }
+      return emitF(i, c[0] * k, c[1] * k, c[2] * k, d, -1);
+    }
+    // тёмное окно: слабое отражение неба и неона
+    const rk = b.style === 2 ? 0.12 : 0.05;
+    const n = vnoise(u * 0.7, z * 0.7, 7);
+    if (b.style === 2 && frac(u * 0.45 + z * 0.9 + (b.seed % 7)) < 0.03) return emitF(i, .35, .4, .5, d, G_['/']);
+    return emitF(i, SKY_HZ[0] * rk + b.neon[0] * 0.03 * n + .01, SKY_HZ[1] * rk + b.neon[1] * 0.03 * n + .01, SKY_HZ[2] * rk + b.neon[2] * 0.03 * n + .015, d, -1);
+  }
+  // стены по стилям
+  if (b.style === 1) {                                                   // жилой: балконы и кондиционеры
+    const hb = hash3(wc, b.seed, 3);
+    if (hb < 0.38 && ffz >= 0.07 && ffz < 0.27 && fx > 0.14 && fx < 0.86) {
+      if (ffz > 0.22) return emitF(i, .5 * Lr * 3, .5 * Lg * 3, .55 * Lb * 3, d, G_['-']);
+      if (frac(fx * 12) < 0.3) return emitF(i, .4 * Lr * 3, .4 * Lg * 3, .45 * Lb * 3, d, G_['|']);
+      return emitF(i, .01, .01, .015, d, -1);
+    }
+    if (hash3(wc, fi, b.seed + 5) < 0.14 && fx > 0.76 && fx < 0.98 && ffz > 0.3 && ffz < 0.52) {
+      const grill = frac((ffz - 0.3) * 40) < 0.5;
+      return emitF(i, .45 * Lr * 3, .45 * Lg * 3, .45 * Lb * 3, d, grill ? G_['='] : G_['#']);
+    }
+  } else if (b.style === 3) {                                            // кирпич
+    const rb = Math.floor(zz * 26), fr = frac(zz * 26), off = (rb & 1) * 0.5;
+    const bu = frac(u * 8 + off);
+    if (ffz >= st.wz0 - 0.06 && ffz < st.wz0 && fx > st.wx0 - 0.05 && fx < st.wx1 + 0.05) return emitF(i, .5 * Lr * 3, .45 * Lg * 3, .4 * Lb * 3, d, G_['=']);
+    const v = 0.75 + 0.5 * hash3(rb, Math.floor(u * 8 + off), b.seed);
+    if (fr < 0.2) return emitF(i, A[0] * Lr * 3, A[1] * Lg * 3, A[2] * Lb * 3, d, G_['_']);
+    if (bu < 0.07) return emitF(i, A[0] * Lr * 3, A[1] * Lg * 3, A[2] * Lb * 3, d, G_['|']);
+    return emitF(i, A[0] * Lr * 6 * v, A[1] * Lg * 6 * v, A[2] * Lb * 6 * v, d, -1);
+  } else if (b.style === 0 && fx < 0.05) {
+    return emitF(i, A[0] * Lr * 8, A[1] * Lg * 8, A[2] * Lb * 8, d, G_['|']);
+  }
+  const n = 0.8 + 0.4 * vnoise(u * 6, z * 12, b.seed & 255);
+  emitF(i, A[0] * Lr * 5 * n, A[1] * Lg * 5 * n, A[2] * Lb * 5 * n, d, -1);
+}
+
+// ============================================================ RAYCASTING
+function castColumn(x) {
+  const camX = 2 * (x + 0.5) / cols - 1;
+  const rdx = dirX + planeX * camX, rdy = dirY + planeY * camX;
+  const ang = player.a + Math.atan(camX * planeLen);
+  const skyEnd = Math.max(0, Math.min(rows, Math.ceil(horizon - 0.5)));
+  for (let r = 0; r < skyEnd; r++) shadeSky(r * cols + x, r, rdx, rdy, ang);
+
+  const px = player.x, py = player.y, eye = CONFIG.eye;
+  let mapX = Math.floor(px), mapY = Math.floor(py);
+  const ddx = Math.abs(1 / rdx), ddy = Math.abs(1 / rdy);
+  let stepX, stepY, sdx, sdy;
+  if (rdx < 0) { stepX = -1; sdx = (px - mapX) * ddx; } else { stepX = 1; sdx = (mapX + 1 - px) * ddx; }
+  if (rdy < 0) { stepY = -1; sdy = (py - mapY) * ddy; } else { stepY = 1; sdy = (mapY + 1 - py) * ddy; }
+  let prevId = tileAt(mapX, mapY), prevH = prevId ? buildings[prevId].h : 0;
+  let yLimit = rows, perp = 0, side = 0, firstBottom = -1;
+  for (let step = 0; step < 500; step++) {
+    if (sdx < sdy) { perp = sdx; sdx += ddx; mapX += stepX; side = 0; }
+    else { perp = sdy; sdy += ddy; mapY += stepY; side = 1; }
+    if (perp > CONFIG.maxDist) break;
+    const id = tileAt(mapX, mapY);
+    if (id === prevId) continue;
+    if (id) {
+      const b = buildings[id];
+      if (b.h > prevH && perp > 0.001) {
+        const top = horizon - (b.h - eye) * projY / perp, bottom = horizon + eye * projY / perp;
+        if (firstBottom < 0) firstBottom = bottom;
+        const r0 = Math.max(0, Math.ceil(top - 0.5)), r1 = Math.min(yLimit, Math.floor(bottom - 0.5) + 1);
+        const hx = px + perp * rdx, hy = py + perp * rdy;
+        const u = side === 0 ? hy : hx;
+        const nx = side === 0 ? -stepX : 0, ny = side === 1 ? -stepY : 0;
+        LOD_ROWS = projY / perp; LOD_COLS = projX / perp;
+        for (let r = r0; r < r1; r++) {
+          const z = eye + (horizon - (r + 0.5)) * perp / projY;
+          shadeFacade(r * cols + x, b, z, u, perp, side, nx, ny, hx, hy);
+        }
+        if (r0 < yLimit) yLimit = r0;
+      }
+    }
+    prevId = id; prevH = id ? buildings[id].h : 0;
+    if (yLimit <= 0) break;
+  }
+  // земля
+  const fb = firstBottom >= 0 ? firstBottom : horizon;
+  const rStart = Math.max(skyEnd, Math.floor(fb - 0.5) + 1);
+  for (let r = rStart; r < rows; r++) {
+    const dy = r + 0.5 - horizon;
+    const rowDist = eye * projY / dy;
+    if (rowDist > CONFIG.maxDist * 1.5) { emit(r * cols + x, FOG[0], FOG[1], FOG[2], rowDist, -1); wetCol[r] = 0; continue; }
+    shadeFloor(r * cols + x, r, px + rdx * rowDist, py + rdy * rowDist, rowDist);
+  }
+  // отражения в мокром асфальте (screen-space: зеркалим относительно основания ближайшего фасада)
+  const refl = CONFIG.reflections;
+  if (refl > 0) for (let r = rStart; r < rows; r++) {
+    const wet = wetCol[r];
+    if (wet <= 0.05) continue;
+    const ripple = rainOn ? Math.sin(time * 5 + r * 1.9 + x * 0.37) * 0.9 : 0;
+    const rs = Math.floor(2 * fb - (r + 0.5) + ripple);
+    if (rs < 0 || rs >= rStart) continue;
+    const k = rs * cols + x, kk = k * 3;
+    const fres = refl * wet * 0.6;
+    addCol(r * cols + x, colBuf[kk] * fres, colBuf[kk + 1] * fres, colBuf[kk + 2] * fres);
+  }
+}
+
+// ============================================================ СПРАЙТЫ
+let SPR_R = 0, SPR_G = 0, SPR_B = 0, SPR_ROWS = 0;
+function drawSprite(sx, sy, z0, w, h, shader, obj, additive) {
+  let rx = sx - player.x, ry = sy - player.y;
+  rx -= N * Math.round(rx / N); ry -= N * Math.round(ry / N);
+  const depth = rx * dirX + ry * dirY;
+  if (depth < 0.15 || depth > CONFIG.maxDist) return;
+  const lat = rx * rightX + ry * rightY;
+  if (Math.abs(lat) > depth * planeLen + w) return;
+  const cx = cols / 2 + lat * projX / depth, halfW = (w / 2) * projX / depth;
+  const top = horizon - (z0 + h - CONFIG.eye) * projY / depth, bot = horizon - (z0 - CONFIG.eye) * projY / depth;
+  let c0 = Math.max(0, Math.ceil(cx - halfW - 0.5)), c1 = Math.min(cols, Math.floor(cx + halfW - 0.5) + 1);
+  if (c1 <= c0) { const cc = Math.floor(cx); if (cc < 0 || cc >= cols || additive) return; c0 = cc; c1 = cc + 1; } // тонкие объекты — минимум 1 столбец
+  const r0 = Math.max(0, Math.ceil(top - 0.5)), r1 = Math.min(rows, Math.floor(bot - 0.5) + 1);
+  if (r1 <= r0) return;
+  sampleLM(sx, sy);
+  const amb = 1 + lightningK * 5;
+  SPR_R = AMBIENT[0] * amb + 0.03 + LR; SPR_G = AMBIENT[1] * amb + 0.03 + LG; SPR_B = AMBIENT[2] * amb + 0.05 + LB;
+  SPR_ROWS = projY / depth;
+  const thin = c1 - c0 === 1 && halfW < 0.5;
+  for (let c = c0; c < c1; c++) {
+    const u = thin ? 0.5 : (c + 0.5 - (cx - halfW)) / (2 * halfW);
+    for (let r = r0; r < r1; r++) {
+      const i = r * cols + c;
+      if (depth >= depthBuf[i]) continue;
+      shader(i, u, (r + 0.5 - top) / (bot - top), depth, obj, rx, ry);
+    }
+  }
+}
+
+function carShader(i, u, v, d, car, rx, ry) {
+  const [vx, vy] = agentVel(car);
+  const toward = vx * rx + vy * ry < 0;
+  const C = car.taxi ? [.95, .7, .05] : car.col;
+  if (v < 0.4) {
+    if (u < 0.17 || u > 0.83) return;
+    if (v < 0.09) return emitF(i, C[0] * SPR_R * 6, C[1] * SPR_G * 6, C[2] * SPR_B * 6, d, G_['_']);
+    if (car.taxi && v < 0.2 && u > 0.4 && u < 0.6) return emitF(i, 1, .8, .2, d, G_['=']);
+    return emitF(i, .05 + SPR_R * .6, .07 + SPR_G * .6, .12 + SPR_B * .6, d, -1);          // стёкла
+  }
+  if (v > 0.86) { if (u < 0.32 || u > 0.68) return emitF(i, .015, .015, .02, d, G_.full); return; }
+  if (v > 0.5 && v < 0.68 && (u < 0.2 || u > 0.8)) {
+    const c = toward ? COL.white : COL.red, k = toward ? 3 : 2.2;
+    return emitF(i, c[0] * k, c[1] * k, c[2] * k, d, G_['O']);
+  }
+  if (v > 0.62 && v < 0.74 && Math.abs(u - 0.5) < 0.1) return emitF(i, .6, .6, .6, d, G_['=']);
+  if (v > 0.76) return emitF(i, .04, .04, .05, d, G_['=']);
+  const spec = Math.abs(v - 0.44) < 0.03 ? 2.2 : 1;
+  emitF(i, C[0] * SPR_R * 5 * spec, C[1] * SPR_G * 5 * spec, C[2] * SPR_B * 5 * spec, d, spec > 1 ? G_['-'] : -1);
+}
+
+function pedShader(i, u, v, d, p) {
+  const vu = p.umbrella ? 0.22 : 0;
+  if (p.umbrella && v < vu) {
+    if (Math.abs(u - 0.5) < 0.48 * Math.sqrt(v / vu)) { const c = p.umbrella, k = 0.35 + SPR_R * 2; return emitF(i, c[0] * k, c[1] * k, c[2] * k, d, v < vu * 0.4 ? G_['^'] : -1); }
+    if (Math.abs(u - 0.5) < 0.04) return emitF(i, .2, .2, .2, d, G_['|']);
+    return;
+  }
+  const vv = (v - vu) / (1 - vu), cu = u - 0.5;
+  if (vv < 0.18) { if (Math.abs(cu) < 0.11) return emitF(i, .75 * SPR_R * 4, .55 * SPR_G * 4, .45 * SPR_B * 4, d, G_['o']); return; }
+  if (vv < 0.62) { if (Math.abs(cu) < 0.21 - (vv < 0.25 ? 0.05 : 0)) return emitF(i, p.coat[0] * SPR_R * 7, p.coat[1] * SPR_G * 7, p.coat[2] * SPR_B * 7, d, -1); return; }
+  const sw = Math.sin(time * 7 + p.phase) * 0.1 * (vv - 0.62) / 0.38;
+  if (Math.abs(cu + 0.09 + sw) < 0.07) return emitF(i, .06, .06, .08, d, G_['/']);
+  if (Math.abs(cu - 0.09 - sw) < 0.07) return emitF(i, .06, .06, .08, d, G_['\\']);
+}
+
+function flyerShader(i, u, v, d, f) {
+  const blink = Math.sin(time * 6 + f.seed) > 0;
+  if (v > 0.8) { if (u > 0.15 && u < 0.85) return emitF(i, .1, .7, 1, d, G_['-']); return; }
+  if (v < 0.35) { if (u > 0.35 && u < 0.65) return emitF(i, .1, .15, .3, d, -1); return; }
+  if (u < 0.1) return emitF(i, blink ? 2 : .2, .1, .1, d, G_['*']);
+  if (u > 0.9) return emitF(i, .1, blink ? 2 : .2, .2, d, G_['*']);
+  emitF(i, .12 + SPR_R, .12 + SPR_G, .15 + SPR_B, d, -1);
+}
+
+function staticShader(i, u, v, d, s) {
+  switch (s.type) {
+    case 'lamp':
+      if (v < 0.06) return emitF(i, s.col[0] * 3, s.col[1] * 3, s.col[2] * 3, d, G_.full);
+      return emitF(i, .1 * SPR_R + .03, .1 * SPR_G + .03, .12 * SPR_B + .04, d, G_['|']);
+    case 'cone': {                                   // объёмный свет фонаря в дожде
+      const hw = 0.035 + 0.43 * v, du = Math.abs(u - 0.5);
+      if (du > hw) return;
+      const k = (1 - du / hw) * (0.25 + 0.75 * v) * (rainOn ? 0.09 : 0.035);
+      return addCol(i, s.col[0] * k, s.col[1] * k, s.col[2] * k);
+    }
+    case 'steam': {
+      const n = vnoise(u * 3 + s.seed, v * 2.5 + time * 0.9, 31) * 0.7 + vnoise(u * 7, v * 6 + time * 1.6, 32) * 0.3;
+      const k = smooth(0.42, 0.8, n) * (1 - Math.abs(u - 0.5) * 2) * Math.pow(v, 0.7) * 0.22;
+      if (k <= 0.004) return;
+      return addCol(i, k * (0.6 + SPR_R), k * (0.6 + SPR_G), k * (0.65 + SPR_B), k > 0.08 ? G_['~'] : undefined);
+    }
+    case 'antenna':
+      if (v < 0.04) { const on = Math.sin(time * 3 + s.seed) > 0.4; return emitF(i, on ? 2.5 : .2, on ? .2 : .03, on ? .15 : .03, d, G_['*']); }
+      return emitF(i, .2 * SPR_R * 3 + .03, .2 * SPR_G * 3 + .03, .22 * SPR_B * 3 + .04, d, v > 0.5 && frac(v * 6) < 0.2 ? G_['+'] : G_['|']);
+    case 'tank': {
+      const cu = Math.abs(u - 0.5);
+      if (v < 0.2) { if (cu < 0.5 * v / 0.2) return emitF(i, .25 * SPR_R * 4, .16 * SPR_G * 4, .1 * SPR_B * 4, d, u < 0.5 ? G_['/'] : G_['\\']); return; }
+      if (v < 0.72) return emitF(i, .3 * SPR_R * 5, .18 * SPR_G * 5, .1 * SPR_B * 5, d, frac(v * 9) < 0.2 ? G_['='] : -1);
+      if (Math.abs(u - 0.15) < 0.06 || Math.abs(u - 0.85) < 0.06) return emitF(i, .2, .2, .22, d, G_['|']);
+      if (Math.abs((u - 0.15) - (v - 0.72) / 0.28 * 0.7) < 0.05) return emitF(i, .15, .15, .17, d, G_['\\']);
+      return;
+    }
+    case 'billboard': {
+      if (v > 0.78) { if (Math.abs(u - 0.15) < 0.03 || Math.abs(u - 0.85) < 0.03) return emitF(i, .15, .15, .18, d, G_['|']); return; }
+      const pv = v / 0.78;
+      if (u < 0.02 || u > 0.98 || pv < 0.04 || pv > 0.96) return emitF(i, s.col[0] * .6, s.col[1] * .6, s.col[2] * .6, d, G_['#']);
+      const L = s.word.length, lu = (u - 0.06) / 0.88 * L, li = Math.floor(lu);
+      const lrows = s.h * 0.78 * 0.6 * SPR_ROWS;
+      const wv = 0.5 + 0.5 * Math.sin(u * 5 + time);
+      let cr = s.col2[0] * 0.2 * wv, cg = s.col2[1] * 0.2 * wv, cb = s.col2[2] * 0.2 * wv;
+      if (pv > 0.2 && pv < 0.8 && li >= 0 && li < L) {
+        if (lrows >= 7) {
+          if (fontPix(s.word[li], Math.floor(frac(lu) * 6), Math.floor((pv - 0.2) / 0.6 * 8))) return emitF(i, s.col[0] * 2, s.col[1] * 2, s.col[2] * 2, d, G_['#']);
+        } else if (lrows >= 1) return emitF(i, s.col[0] * 2, s.col[1] * 2, s.col[2] * 2, d, gi(s.word[li]));
+      }
+      return emitF(i, cr, cg, cb, d, -1);
+    }
+    case 'tlight': {
+      if (v < 0.3) {
+        if (Math.abs(u - 0.5) > 0.5) return;
+        const st = lightState(s.axis), slot = Math.floor(v / 0.1);       // 0 красный, 1 жёлтый, 2 зелёный сверху вниз
+        const on = (slot === 0 && st === 0) || (slot === 1 && st === 1) || (slot === 2 && st === 2);
+        const c = slot === 0 ? COL.red : slot === 1 ? COL.amber : COL.green;
+        if (on) return emitF(i, c[0] * 2.5, c[1] * 2.5, c[2] * 2.5, d, G_['O']);
+        return emitF(i, c[0] * .06 + .02, c[1] * .06 + .02, c[2] * .06 + .02, d, G_['o']);
+      }
+      return emitF(i, .2 * SPR_R * 3, .2 * SPR_G * 3, .22 * SPR_B * 3, d, G_['|']);
+    }
+  }
+}
+
+function drawSprites() {
+  const list = [];
+  const consider = (x, y, extra) => {
+    let rx = x - player.x, ry = y - player.y;
+    rx -= N * Math.round(rx / N); ry -= N * Math.round(ry / N);
+    const dp = rx * dirX + ry * dirY;
+    if (dp < 0.15 || dp > CONFIG.maxDist) return;
+    if (Math.abs(rx * rightX + ry * rightY) > dp * planeLen + 2) return;
+    extra.depth = dp; list.push(extra);
+  };
+  for (const s of statics) consider(s.x, s.y, { x: s.x, y: s.y, z0: s.z0, w: s.w, h: s.h, sh: staticShader, o: s, add: s.type === 'cone' || s.type === 'steam' });
+  for (const c of cars) { const [x, y] = agentPos(c); consider(x, y, { x, y, z0: 0, w: 0.4, h: 0.19, sh: carShader, o: c }); }
+  for (const p of peds) { const [x, y] = agentPos(p); consider(x, y, { x, y, z0: 0, w: p.umbrella ? 0.16 : 0.09, h: p.umbrella ? 0.23 : 0.18, sh: pedShader, o: p }); }
+  for (const f of flyers) consider(f.x, f.y, { x: f.x, y: f.y, z0: f.z, w: 0.36, h: 0.1, sh: flyerShader, o: f });
+  list.sort((a, b) => b.depth - a.depth);
+  for (const s of list) drawSprite(s.x, s.y, s.z0, s.w, s.h, s.sh, s.o, s.add);
+}
+
+// ============================================================ ДОЖДЬ, UI
+const rain = [];
+function initRain() {
+  rain.length = 0;
+  for (let k = 0; k < CONFIG.rainDrops; k++) rain.push({ x: Math.random(), y: Math.random() * 1.2 - 0.2, z: 0.5 + Math.pow(Math.random(), 1.5) * 25 });
+}
+function drawRain(dt) {
+  const rc = [.5, .6, .8];
+  for (const d of rain) {
+    const sp = 2.2 / (0.4 + d.z * 0.12);
+    d.y += sp * dt;
+    d.x += 0.03 * dt * sp;
+    if (d.y > 1.05) { d.y = -0.1 * Math.random(); d.x = Math.random(); d.z = 0.5 + Math.pow(Math.random(), 1.5) * 25; }
+    const len = Math.max(1, Math.min(8, Math.round(rows * 0.06 / d.z)));
+    const k = Math.min(0.5, 0.25 / d.z + 0.03);
+    const c = Math.floor(frac(d.x) * cols), r0 = Math.floor(d.y * rows);
+    for (let t = 0; t < len; t++) {
+      const r = r0 + t;
+      if (r < 0 || r >= rows) continue;
+      const i = r * cols + c;
+      if (d.z >= depthBuf[i]) continue;
+      const kk = i * 3, f = k * (1 - t / len * 0.6);
+      addCol(i, rc[0] * f + colBuf[kk] * f, rc[1] * f + colBuf[kk + 1] * f, rc[2] * f + colBuf[kk + 2] * f, d.z < 3 ? G_['/'] : G_['|']);
+    }
+  }
+}
+function text(x, y, str, c, k) {
+  if (y < 0 || y >= rows) return;
+  for (let q = 0; q < str.length; q++) {
+    const xx = x + q;
+    if (xx < 0 || xx >= cols) continue;
+    const i = y * cols + xx;
+    glyphBuf[i] = gi(str[q]);
+    const j = i * 4;
+    fgBuf[j] = c[0] * k * 255; fgBuf[j + 1] = c[1] * k * 255; fgBuf[j + 2] = c[2] * k * 255;
+    bgBuf[j] = 0; bgBuf[j + 1] = 0; bgBuf[j + 2] = 0;
+  }
+}
+function drawMinimap() {
+  const tw = 31, th = 31, mw = tw * 2 + 2, mh = th + 2, x0 = cols - mw - 1, y0 = 2;
+  if (x0 < 0 || y0 + mh > rows) return;
+  const border = [.15, .9, 1];
+  for (let yy = 0; yy < mh; yy++) for (let xx = 0; xx < mw; xx++) {
+    const eY = yy === 0 || yy === mh - 1, eX = xx === 0 || xx === mw - 1;
+    text(x0 + xx, y0 + yy, eY && eX ? '+' : eY ? '-' : eX ? '|' : ' ', border, .6);
+  }
+  const pxI = Math.floor(player.x), pyI = Math.floor(player.y);
+  for (let ty = 0; ty < th; ty++) for (let tx = 0; tx < tw; tx++) {
+    const wx = pxI + tx - (tw >> 1), wy = pyI + ty - (th >> 1), id = tileAt(wx, wy), g = groundAt(wx, wy);
+    let s = ' ', c = COL.white, k = 0;
+    if (id) { const b = buildings[id]; if (b.kind === 'tree') { s = '&'; c = COL.green; k = .6; } else { s = '#'; c = b.neon; k = Math.min(1, 0.25 + b.h / 12); } }
+    else if (g === 1) { s = '.'; k = .35; } else if (g === 2) { s = ','; c = COL.green; k = .5; }
+    text(x0 + 1 + tx * 2, y0 + 1 + ty, s + s, c, k);
+  }
+  for (const car of cars) {
+    const [x, y] = agentPos(car);
+    let dx = x - player.x, dy = y - player.y;
+    dx -= N * Math.round(dx / N); dy -= N * Math.round(dy / N);
+    const tx = Math.floor(player.x + dx) - pxI + (tw >> 1), ty = Math.floor(player.y + dy) - pyI + (th >> 1);
+    if (tx >= 0 && tx < tw && ty >= 0 && ty < th) text(x0 + 1 + tx * 2, y0 + 1 + ty, 'c', car.col, 1);
+  }
+  const cxm = x0 + 1 + (tw >> 1) * 2, cym = y0 + 1 + (th >> 1);
+  text(cxm, cym, '@', COL.amber, 1);
+  text(cxm + Math.round(dirX * 1.4) * 2, cym + Math.round(dirY * 1.4), '*', COL.amber, .8);
+}
+
+// ============================================================ ВВОД
+const keys = new Set();
+let showMap = false, glowOn = true, showHelp = true, locked = false;
+addEventListener('keydown', e => {
+  keys.add(e.code);
+  if (e.code === 'KeyM') showMap = !showMap;
+  if (e.code === 'KeyR') rainOn = !rainOn;
+  if (e.code === 'KeyG') glowOn = !glowOn;
+  if (e.code === 'KeyH') showHelp = !showHelp;
+  if (e.code === 'KeyB') bgFill = bgFill > 0 ? 0 : CONFIG.bgFill;
+  if (e.code === 'KeyL') { flash = 0.5; }
+  if (e.code === 'Equal' || e.code === 'NumpadAdd') { CONFIG.resIndex = Math.min(CONFIG.resPresets.length - 1, CONFIG.resIndex + 1); resize(); }
+  if (e.code === 'Minus' || e.code === 'NumpadSubtract') { CONFIG.resIndex = Math.max(0, CONFIG.resIndex - 1); resize(); }
+});
+addEventListener('keyup', e => keys.delete(e.code));
+canvas.addEventListener('click', () => canvas.requestPointerLock && canvas.requestPointerLock());
+document.addEventListener('pointerlockchange', () => { locked = document.pointerLockElement === canvas; });
+addEventListener('mousemove', e => {
+  if (!locked) return;
+  player.a += e.movementX * CONFIG.mouseSens;
+  player.pitch = Math.max(-rows * 1.2, Math.min(rows * 1.2, player.pitch - e.movementY * 0.12 * rows / 60));
+});
+let touchMove = null, touchLook = null;
+addEventListener('touchstart', e => { for (const t of e.changedTouches) { if (t.clientX < innerWidth / 2) touchMove = { id: t.identifier, x: t.clientX, y: t.clientY, dx: 0, dy: 0 }; else touchLook = { id: t.identifier, x: t.clientX, y: t.clientY }; } }, { passive: true });
+addEventListener('touchmove', e => { for (const t of e.changedTouches) {
+  if (touchMove && t.identifier === touchMove.id) { touchMove.dx = t.clientX - touchMove.x; touchMove.dy = t.clientY - touchMove.y; }
+  if (touchLook && t.identifier === touchLook.id) { player.a += (t.clientX - touchLook.x) * 0.006; player.pitch = Math.max(-rows * 1.2, Math.min(rows * 1.2, player.pitch - (t.clientY - touchLook.y) * 0.3)); touchLook.x = t.clientX; touchLook.y = t.clientY; }
+} }, { passive: true });
+addEventListener('touchend', e => { for (const t of e.changedTouches) { if (touchMove && t.identifier === touchMove.id) touchMove = null; if (touchLook && t.identifier === touchLook.id) touchLook = null; } });
+
+// ============================================================ ОБНОВЛЕНИЕ
+function updateCars(dt) {
+  const lanes = new Map();
+  for (const c of cars) { const key = c.axis + c.fixed; if (!lanes.has(key)) lanes.set(key, []); lanes.get(key).push(c); }
+  for (const c of cars) {
+    let want = c.vmax;
+    const dir = Math.sign(c.vmax), t = c.t, lt = t % B;
+    // светофор
+    if (lightState(c.axis === 'h' ? 'h' : 'v') !== 2 && lt >= R) {
+      const dist = dir > 0 ? (B - lt) - 0.35 : (lt - R) - 0.35;
+      if (dist > -0.05 && dist < 1.2) want = Math.min(Math.abs(want), Math.max(0, dist) * 3) * dir;
+    }
+    // дистанция до машины впереди
+    for (const o of lanes.get(c.axis + c.fixed)) {
+      if (o === c) continue;
+      let gap = (o.t - t) * dir; gap -= N * Math.floor(gap / N);
+      if (gap < 1.2) want = Math.min(Math.abs(want), Math.max(0, gap - 0.55) * 3) * dir;
+    }
+    c.v += (want - c.v) * Math.min(1, dt * 3);
+    c.t = wrapF(c.t + c.v * dt);
+  }
+}
+function update(dt) {
+  time += dt;
+  if (keys.has('ArrowLeft')) player.a -= CONFIG.turnSpeed * dt;
+  if (keys.has('ArrowRight')) player.a += CONFIG.turnSpeed * dt;
+  if (keys.has('PageUp')) player.pitch += rows * dt;
+  if (keys.has('PageDown')) player.pitch -= rows * dt;
+  dirX = Math.cos(player.a); dirY = Math.sin(player.a);
+  rightX = -dirY; rightY = dirX;
+  planeX = rightX * planeLen; planeY = rightY * planeLen;
+  let f = 0, s = 0;
+  if (keys.has('KeyW') || keys.has('ArrowUp')) f += 1;
+  if (keys.has('KeyS') || keys.has('ArrowDown')) f -= 1;
+  if (keys.has('KeyD')) s += 1;
+  if (keys.has('KeyA')) s -= 1;
+  if (touchMove) { f = Math.max(-1, Math.min(1, -touchMove.dy / 60)); s = Math.max(-1, Math.min(1, touchMove.dx / 60)); }
+  const sp = CONFIG.walkSpeed * (keys.has('ShiftLeft') || keys.has('ShiftRight') ? CONFIG.runMul : 1) * dt;
+  const mx = (dirX * f + rightX * s) * sp, my = (dirY * f + rightY * s) * sp;
+  if (!blocked(player.x + mx, player.y)) player.x += mx;
+  if (!blocked(player.x, player.y + my)) player.y += my;
+
+  updateCars(dt);
+  for (const p of peds) p.t = wrapF(p.t + p.v * dt);
+  for (const fl of flyers) { fl.x = wrapF(fl.x + fl.vx * dt); fl.y = wrapF(fl.y + fl.vy * dt); }
+
+  // молния
+  if (rainOn && time > nextFlash) { flash = 0.35; nextFlash = time + 15 + Math.random() * 30; }
+  flash = Math.max(0, flash - dt);
+  lightningK = flash > 0 ? (Math.sin(flash * 60) > 0 ? flash * 2 : flash * 0.5) : 0;
+
+  // динамический свет: фары и стоп-сигналы
+  lm.set(lmStatic);
+  for (const c of cars) {
+    const [x, y] = agentPos(c);
+    let dx = x - player.x, dy = y - player.y;
+    dx -= N * Math.round(dx / N); dy -= N * Math.round(dy / N);
+    if (dx * dx + dy * dy > 45 * 45) continue;
+    const ddx = c.axis === 'h' ? Math.sign(c.vmax) : 0, ddy = c.axis === 'v' ? Math.sign(c.vmax) : 0;
+    for (let k = 0; k < 4; k++) {
+      const dist = 0.35 + k * 0.5, rad = 0.22 + k * 0.17;
+      splat(lm, x + ddx * dist, y + ddy * dist, rad, COL.white, 0.9 - k * 0.15);
+    }
+    splat(lm, x - ddx * 0.3, y - ddy * 0.3, 0.3, COL.red, Math.abs(c.v) < 0.5 ? 1.2 : 0.5);
+  }
+}
+
+// ============================================================ КАДР
+let fps = 60, lastT = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  fps = fps * 0.95 + (1 / Math.max(dt, 1e-3)) * 0.05;
+  update(dt);
+
+  horizon = rows * 0.5 + player.pitch;
+  for (let x = 0; x < cols; x++) castColumn(x);
+  drawSprites();
+  if (rainOn) drawRain(dt);
+  if (glowOn) bloom();
+  if (showMap) drawMinimap();
+
+  text(1, 0, ' ASCII CITY // prototype 0.2 ', COL.cyan, 1);
+  text(31, 0, `${fps | 0} fps   ${cols}x${rows} = ${cols * rows} символов`, COL.white, .55);
+  if (showHelp) {
+    text(1, rows - 2, ' WASD идти · мышь смотреть (клик) · Shift бег · +/- детализация · M карта · R дождь · G свечение · B фон · L молния · H скрыть ', COL.amber, .9);
+  }
+  if (!locked && Math.floor(time * 2) % 2 === 0 && !('ontouchstart' in window))
+    text((cols >> 1) - 17, rows >> 1, '[ кликни, чтобы смотреть мышью ]', COL.pink, 1);
+
+  present();
+  requestAnimationFrame(frame);
+}
+function present() {
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texGlyph);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RED, gl.UNSIGNED_BYTE, glyphBuf);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texFg);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, fgU8);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texBg);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, bgU8);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// bloom на уровне ячеек: яркие ячейки подсвечивают фон соседей (размытие по сетке символов)
+function bloom() {
+  const n = cols * rows, A = glowA, Bf = glowB, TH = 0.7;
+  for (let k = 0; k < n * 3; k++) { const v = colBuf[k] - TH; A[k] = v > 0 ? v : 0; }
+  const rx = Math.max(2, Math.round(cols / 110)), ry = Math.max(1, Math.round(rx * cw / ch));
+  for (let y = 0; y < rows; y++) for (let c = 0; c < 3; c++) {          // по горизонтали
+    let sum = 0; const base = y * cols;
+    for (let x = -rx; x < cols + rx; x++) {
+      if (x + rx < cols) sum += A[(base + x + rx) * 3 + c];
+      if (x - rx - 1 >= 0) sum -= A[(base + x - rx - 1) * 3 + c];
+      if (x >= 0 && x < cols) Bf[(base + x) * 3 + c] = sum / (2 * rx + 1);
+    }
+  }
+  for (let x = 0; x < cols; x++) for (let c = 0; c < 3; c++) {          // по вертикали
+    let sum = 0;
+    for (let y = -ry; y < rows + ry; y++) {
+      if (y + ry < rows) sum += Bf[((y + ry) * cols + x) * 3 + c];
+      if (y - ry - 1 >= 0) sum -= Bf[((y - ry - 1) * cols + x) * 3 + c];
+      if (y >= 0 && y < rows) A[(y * cols + x) * 3 + c] = sum / (2 * ry + 1);
+    }
+  }
+  const K = 0.45 * 255;
+  for (let i = 0; i < n; i++) {
+    const j = i * 4, k = i * 3;
+    bgBuf[j] += A[k] * K; bgBuf[j + 1] += A[k + 1] * K; bgBuf[j + 2] += A[k + 2] * K;
+  }
+}
+
+// ============================================================ СТАРТ
+generateCity(CONFIG.seed);
+spawnAgents(CONFIG.seed);
+initRain();
+resize();
+addEventListener('resize', resize);
+lm.set(lmStatic);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
